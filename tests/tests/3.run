@@ -1,1 +1,1 @@
-./check-mkfs.py 32 224 test-disk1
+./wfs-check-metadata.py --mode mkfs --inodes 32 --blocks 224 --disks test-disk1
