@@ -7,8 +7,6 @@
 #include <sys/types.h>
 #include "wfs.h"
 
-#define MAX_DISKS 10
-
 // RAID modes
 typedef enum {
     RAID_UNKNOWN = -1,
@@ -94,6 +92,14 @@ int main(int argc, char *argv[])
     sb.d_bitmap_ptr = d_bitmap_offset;
     sb.i_blocks_ptr = inode_region_offset;
     sb.d_blocks_ptr = data_region_offset;
+    sb.raid_mode = raid_mode;
+    sb.num_disks = disk_count;
+
+    for (int i = 0; i < disk_count; i++)
+    {
+        strncpy(sb.disk_order[i], disk_files[i], MAX_NAME - 1);
+        sb.disk_order[i][MAX_NAME - 1] = '\0';
+    }
 
     // Allocate and initialize bitmaps for inodes and data blocks
     char *ibitmap = calloc(1, i_bitmap_size);

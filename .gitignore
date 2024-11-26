@@ -62,3 +62,4 @@ tests/tests/6.run
 tests/tests/7.run
 tests/tests/8.run
 tests/tests/9.run
+tests/__pycache__/wfsverify.cpython-310.pyc

@@ -3,6 +3,7 @@
 
 #define BLOCK_SIZE (512)
 #define MAX_NAME   (28)
+#define MAX_DISKS 10
 
 #define D_BLOCK    (6)
 #define IND_BLOCK  (D_BLOCK+1)
@@ -32,6 +33,9 @@ struct wfs_sb {
     off_t i_blocks_ptr;
     off_t d_blocks_ptr;
     // Extend after this line
+    int raid_mode;
+    int num_disks;
+    char disk_order[MAX_DISKS][MAX_NAME];
 };
 
 // Inode
