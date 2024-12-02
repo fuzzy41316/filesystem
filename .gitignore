@@ -68,3 +68,8 @@ solution/wfs
 solution/mkfs
 solution/wfs
 .gitignore
+tests/tests/10.run
+tests/tests-out/10.err
+tests/tests-out/10.out
+tests/tests-out/10.pre-rc
+tests/tests-out/10.run-rc

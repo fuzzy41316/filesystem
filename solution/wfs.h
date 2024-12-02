@@ -23,7 +23,6 @@
 i_bitmap_ptr        i_blocks_ptr
 
 */
-
 // Superblock
 struct wfs_sb {
     size_t num_inodes;
