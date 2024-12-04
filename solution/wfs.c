@@ -722,8 +722,62 @@ static int wfs_read(const char* path, char *buf, size_t size, off_t offset, stru
 static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) 
 {
     printf("write");
-    // Implement file write logic here
-    return -ENOSYS;
+    
+    // Get the inodex index from the path
+    int inode_num = get_inode_from_path(path);
+    if (inode_num < 0)
+        return -ENOENT; // Not found
+
+    // Get the inode pointer from the inode number
+    struct wfs_inode *inode_ptr = get_inode(inode_num);
+
+    // Check if regular file
+    if (!(inode_ptr->mode & S_IFREG))
+        return -EISDIR; // Not a regular file
+
+    // Check that offset is within size of inode
+    if (offset > inode_ptr->size)
+        return -EFBIG; // Invalid offset
+    
+    // Calculate new size of file after writing
+    off_t new_size = offset + size;
+    if (new_size > inode_ptr->size)
+        inode_ptr->size = new_size;
+    
+    // Write data to new file
+    size_t bytes_written = 0;
+    size_t bytes_remaining = size;
+    off_t curr_offset = offset;
+
+    while (bytes_written < size)
+    {
+        // Calculate the block number and offset within the block
+        off_t block_index = curr_offset / BLOCK_SIZE;
+        off_t block_offset = curr_offset % BLOCK_SIZE;
+
+        // Allocate new data block if nessecary 
+        if (block_index >= N_BLOCKS + BLOCK_SIZE / sizeof(off_t))
+            return -EFBIG; // File too large
+
+        // Get the block pointer
+        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 1);
+        if (block_ptr == NULL)
+            return -EIO; // Error if block is not found
+        
+        // Write data to the block
+        size_t bytes_to_copy = BLOCK_SIZE - block_offset;
+        if (bytes_to_copy > bytes_remaining)
+            bytes_to_copy = bytes_remaining;
+
+        memcpy((char *)block_ptr + block_offset, buf + bytes_written, bytes_to_copy);
+
+        // Update the variables
+        bytes_written += bytes_to_copy;
+        bytes_remaining -= bytes_to_copy;
+        curr_offset += bytes_to_copy;
+    }
+
+    return bytes_written;   // Success
 }
 
 /*
