@@ -48,6 +48,103 @@ void set_bitmap_bit(char *bitmap, off_t index);
 static int add_directory_entry(struct wfs_inode *inode_ptr, const char *name, int inode_num, time_t curr_time);
 static int allocate_data_block();
 static int is_directory(int inode_idx);
+static int release_data_blocks(struct wfs_inode *inode);
+static void clear_bitmap_bit(char *bitmap, off_t bit_offset);
+static int remove_directory_entry(const char *path);
+
+/* Remove the directory entry */
+static int remove_directory_entry(const char *path)
+{
+    char parent_path[strlen(path) + 1]; // Make parent_path
+    strcpy(parent_path, path);          // Assign path as parent
+    char *final_slash = strrchr(parent_path, '/'); // Find the final slash
+
+    if (final_slash == NULL)
+        return -EINVAL; // Error if no slash found
+
+    int parent_inode = get_inode_from_path(parent_path); // Get the parent inode
+    if (parent_inode < 0)
+        return -ENOENT; // Return error if parent inode is invalid
+    
+    struct wfs_inode *parent_inode_ptr = get_inode(parent_inode);
+    if (!(parent_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // Return error if parent directory is not writable
+    
+    // Find the target entry
+    int found = 0;
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        struct wfs_dentry *entries = get_directory_entry(parent_inode_ptr->blocks[i]);
+
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+        {
+            if (entries[j].num == 0)
+                continue;   // Skip if empty
+            
+            if (strcmp(entries[j].name, final_slash + 1) == 0)
+            {
+                // If found, delete it
+                entries[j].num = 0; // Reset the entry
+                memset(entries[j].name, 0, MAX_NAME);
+                found = 1;
+                break;
+            }
+        }
+        if (found)
+            break;
+    }
+    if (!found)
+        return -ENOENT; // Return error if not found
+    return 0;   // Success otherwise
+}
+
+
+/* Clear the bitmap bit */
+void clear_bitmap_bit(char *bitmap, off_t index)
+{
+    bitmap[index / 8] &= ~(1 << (index % 8));
+}
+
+/* Release data blocks associated with inode */
+static int release_data_blocks(struct wfs_inode *inode)
+{
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        if (inode->blocks[i] == 0)
+            continue;   // Skip if unused
+        
+        // Clear the data block from data bitmap
+        memset((char *)inode->blocks[i] + superblock->d_blocks_ptr, 0, BLOCK_SIZE);
+        clear_bitmap_bit((char *)disk_mmap[0] + superblock->d_bitmap_ptr, (inode->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+
+        // Reset data blocks in the inode
+        inode->blocks[i] = 0;
+    }
+    
+    // Find any indirect blocks
+    if (inode->blocks[IND_BLOCK] != 0)  
+    {
+        off_t *indirect = (off_t *)((char *)disk_mmap[0] + inode->blocks[IND_BLOCK]);
+
+        for (size_t i = 0; i < BLOCK_SIZE / sizeof(off_t); i++)
+        {
+            if (indirect[0] == 0)
+                continue;   // Skip if unused   
+            
+            // Clear the bitmap bit for indirect blocks
+            clear_bitmap_bit((char *)disk_mmap[0] + superblock->d_bitmap_ptr, (indirect[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+
+            // Reset to 0
+            memset((char *)indirect[i] + superblock->d_blocks_ptr, 0, BLOCK_SIZE);
+        }
+
+        memset(indirect, 0, BLOCK_SIZE);
+        clear_bitmap_bit((char *)disk_mmap[0] + superblock->d_bitmap_ptr, (inode->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+    }
+
+    return 0; // Success
+}
+
 
 /* Check if the given inode from the inode index is a directory or other file */
 static int is_directory(int inode_idx)
@@ -420,7 +517,30 @@ static int wfs_mkdir(const char *path, mode_t mode)
 */
 static int wfs_unlink(const char *path) 
 {
-    // Implement file deletion logic here
+    // Find the file inode to delete
+    int inode_num = get_inode_from_path(path);
+    if (inode_num < 0)
+        return -ENOENT; // Not found
+
+    // Get the inode from number
+    struct wfs_inode *inode_ptr = get_inode(inode_num);
+
+    // Make sure it's writabble
+    if (!(inode_ptr->mode & S_IWUSR))
+        return -EACCES; // Not writable
+    
+    int res = release_data_blocks(inode_ptr);  
+    if (res < 0)
+        return res; // Return error if data blocks not released
+    
+    res = remove_directory_entry(path);
+    if (res < 0)
+        return res; // Return error if directory entry not removed
+    
+    // After removing data blocks, and the inode fromt the directory, clear the bitmap bit
+    clear_bitmap_bit((char *)superblock->i_bitmap_ptr + (off_t)(inode_num / 8), inode_num % 8);
+
+
     return -ENOSYS;
 }
 
