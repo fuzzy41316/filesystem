@@ -51,6 +51,69 @@ static int is_directory(int inode_idx);
 static int release_data_blocks(struct wfs_inode *inode);
 static void clear_bitmap_bit(char *bitmap, off_t bit_offset);
 static int remove_directory_entry(const char *path);
+static off_t *get_block_ptr(struct wfs_inode *inode_ptr, off_t block_index, int allocate);
+
+/* Given a pointer to the inode, block index, and allocate flag, get the block pointer for the block index */
+static off_t *get_block_ptr(struct wfs_inode *inode_ptr, off_t block_index, int allocate)
+{
+    // Direct block access
+    if (block_index < D_BLOCK)
+    {
+        if (inode_ptr->blocks[block_index] == 0 && allocate)
+        {
+            // Allocate the block if specified
+            int data_index = allocate_data_block(); 
+            if (data_index < 0)
+                return NULL; // Return NULL if no space
+            
+            inode_ptr->blocks[block_index] = data_index;
+        }
+        else if (inode_ptr->blocks[block_index] == 0)
+            return NULL;
+        return (off_t *)(inode_ptr->blocks[block_index] + (char *)disk_mmap[0]);
+    }
+
+    // Indirect block access
+    else
+    {
+        off_t indirect_block_index = block_index - D_BLOCK;
+
+        if (indirect_block_index >= BLOCK_SIZE / sizeof(off_t))
+            return NULL; // Return NULL if block index is out of range
+        
+        // Check if indirect block is allocated
+        if (inode_ptr->blocks[IND_BLOCK] == 0)
+        {
+            if (!allocate)
+                return NULL; // Return NULL if block is not allocated and not allowed to
+            
+            // Allocate a new 
+            int indirect_block = allocate_data_block();
+
+            if (indirect_block < 0)
+                return NULL; // Return NULL if no space
+            
+            inode_ptr->blocks[IND_BLOCK] = indirect_block;
+            // Clear new indirect block
+            memset((char *)((indirect_block) + (off_t)disk_mmap[0]), 0, BLOCK_SIZE);
+        }
+        // Get pointer to indirect block
+        off_t *indirect_block_ptr = (off_t *)((inode_ptr->blocks[IND_BLOCK]) + (off_t)disk_mmap[0]);
+
+        // Check if new entry is allocated, if not then allocate
+        if (indirect_block_ptr[indirect_block_index] == 0 && allocate)
+        {
+            int data_index = allocate_data_block();
+            if (data_index < 0)
+                return NULL; // Return NULL if no space
+            
+            indirect_block_ptr[indirect_block_index] = data_index;
+        }
+
+        // Return pointer to data block within the indirect block
+        return (off_t *)(indirect_block_ptr[indirect_block_index] + (off_t)disk_mmap[0]);
+    }
+}
 
 /* Remove the directory entry */
 static int remove_directory_entry(const char *path)
@@ -462,6 +525,8 @@ struct wfs_inode * get_inode(const int inode_num)
 */
 static int wfs_getattr(const char *path, struct stat *stbuf) 
 {
+    printf("getattr");
+
     // Translate the path to an inode number (wfs_inode->num)
     int inode_num = get_inode_from_path(path);
     if (inode_num == -ENOENT)
@@ -489,6 +554,7 @@ static int wfs_getattr(const char *path, struct stat *stbuf)
 */ 
 static int wfs_mknod(const char *path, mode_t mode, dev_t rdev) 
 {
+    printf("mknod");
     int res;
 
     // Some sort of error in creating entry, pipeline error code
@@ -503,6 +569,7 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
 */
 static int wfs_mkdir(const char *path, mode_t mode) 
 {
+    printf("mkdir");
     int res;
 
     // Set directory flag
@@ -517,6 +584,7 @@ static int wfs_mkdir(const char *path, mode_t mode)
 */
 static int wfs_unlink(const char *path) 
 {
+    printf("unlink");
     // Find the file inode to delete
     int inode_num = get_inode_from_path(path);
     if (inode_num < 0)
@@ -549,6 +617,7 @@ static int wfs_unlink(const char *path)
 */
 static int wfs_rmdir(const char *path) 
 {
+    printf("rmdir");
     // Check that path is not current directory (. and ..)
     char *final_slash = strchr(path, '/');
     if (final_slash != NULL && strcmp(final_slash + 1, ".") == 0)
@@ -593,8 +662,58 @@ static int wfs_rmdir(const char *path)
 */
 static int wfs_read(const char* path, char *buf, size_t size, off_t offset, struct fuse_file_info* fi) 
 {
-    // Implement file read logic here
-    return -ENOSYS;
+    printf("read");
+
+    // Get the file inode from path
+    int inode_num = get_inode_from_path(path);
+    if (inode_num < 0)
+        return -ENOENT; // Not found
+
+    // Get the inode pointer from the inode number
+    struct wfs_inode *inode_ptr = get_inode(inode_num);
+
+    // Check if regular file
+    if (!(inode_ptr->mode & S_IFREG))
+        return -EISDIR; // Not a regular file
+
+    // Make sure offset is within file size
+    if (offset >= inode_ptr->size)
+        return 0;   // Offset is at or beyond the end of the file
+
+    // Adjust size
+    size_t bytes_to_read = size;
+    if (offset + size > inode_ptr->size)
+        bytes_to_read = inode_ptr->size - offset;
+    
+    // Now read data from the file
+    size_t bytes_read = 0;
+    size_t bytes_remaining = bytes_to_read;
+    off_t curr_offset = offset;
+
+    while (bytes_read < bytes_to_read)
+    {
+        // Caclulate the block number and offset within the block
+        off_t block_index = curr_offset / BLOCK_SIZE;
+        off_t block_offset = curr_offset % BLOCK_SIZE;
+
+        // Check if block is an indirect block
+        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 0);
+        if (block_ptr == NULL)
+            return -EIO; // Error if block is not found
+
+        // Read the data from the block
+        size_t bytes_to_copy = BLOCK_SIZE - block_offset;
+        if (bytes_to_copy > bytes_remaining)
+            bytes_to_copy = bytes_remaining;
+
+        memcpy(buf + bytes_read, ((char *)block_ptr + block_offset), bytes_to_copy);
+
+        // Update the variables
+        bytes_read += bytes_to_copy;
+        bytes_remaining -= bytes_to_copy;
+        curr_offset += bytes_to_copy;
+    }
+    return bytes_read;
 }
 
 /*
@@ -602,6 +721,7 @@ static int wfs_read(const char* path, char *buf, size_t size, off_t offset, stru
 */
 static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) 
 {
+    printf("write");
     // Implement file write logic here
     return -ENOSYS;
 }
@@ -623,6 +743,8 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
 */
 static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) 
 {
+    printf("readdir");
+
     // Find first directory
     int inode_idx = get_inode_from_path(path);
     if (inode_idx < 0)
@@ -670,36 +792,85 @@ static struct fuse_operations ops = {
 
 int main(int argc, char *argv[]) 
 {
-    // Extract disk files from arguments
-    int fuse_argc = 0;
-    char *fuse_argv[argc + 1]; // +1 for NULL terminator
+    // Need at least 2 disks and a mount point
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s disk1 disk2 [FUSE options] mount_point\n", argv[0]);
+        return 1;
+    }
+
+    // Count disks by checking if arguments are disk files
     disk_count = 0;
-
-    // Assume the first arguments are disk files until we encounter a FUSE option (starting with '-')
-    int i = 1; // argv[0] is program name
-    while (i < argc && argv[i][0] != '-') 
-    {
-        if (disk_count < MAX_DISKS) disk_files[disk_count++] = argv[i++];
-        else 
-        {
-            fprintf(stderr, "Error: Too many disks.\n");
-            exit(1);
+    int fuse_args_start = 1;
+    while (fuse_args_start < argc && disk_count < MAX_DISKS) {
+        // Check if argument starts with "-" (FUSE option)
+        if (argv[fuse_args_start][0] == '-') {
+            break;
         }
+        disk_files[disk_count++] = argv[fuse_args_start++];
     }
 
-    if (disk_count < 2) 
-    {
-        fprintf(stderr, "Error: Not enough disks.\n");
-        exit(1);
+    // Open and mmap all disk files
+    for (int i = 0; i < disk_count; i++) {
+        int fd = open(disk_files[i], O_RDWR);
+        if (fd < 0) {
+            fprintf(stderr, "Error: Cannot open disk file %s\n", disk_files[i]);
+            return 1;
+        }
+
+        // Get disk size
+        struct stat st;
+        if (fstat(fd, &st) < 0) {
+            fprintf(stderr, "Error: Cannot stat disk file %s\n", disk_files[i]);
+            close(fd);
+            return 1;
+        }
+        disk_size[i] = st.st_size;
+
+        // mmap the disk
+        disk_mmap[i] = mmap(NULL, disk_size[i], PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (disk_mmap[i] == MAP_FAILED) {
+            fprintf(stderr, "Error: Cannot mmap disk file %s\n", disk_files[i]);
+            close(fd);
+            return 1;
+        }
+        close(fd); // Can close fd after mmap
     }
 
-    // Prepare FUSE arguments
-    fuse_argv[fuse_argc++] = argv[0]; // Program name
-    while (i < argc) fuse_argv[fuse_argc++] = argv[i++];
+    // Get superblock from first disk
+    superblock = (struct wfs_sb *)disk_mmap[0];
+    
+    // Verify correct number of disks mounted
+    if (disk_count != superblock->num_disks) {
+        fprintf(stderr, "Error: Wrong number of disks. Expected %d, got %d\n", 
+                superblock->num_disks, disk_count);
+        return 1;
+    }
 
-    // Null-terminate the fuse_argv array
-    fuse_argv[fuse_argc] = NULL;
+    // Set RAID mode from superblock
+    raid_mode = superblock->raid_mode;
 
-    // Call fuse_main with FUSE options and mount point
-    return fuse_main(fuse_argc, fuse_argv, &ops, NULL);
+    // Create new argv array for FUSE
+    char **fuse_argv = malloc((argc - disk_count + 1) * sizeof(char *));
+    if (!fuse_argv) {
+        return 1;
+    }
+    
+    // Adjust fuse arguments - first arg should be program name
+    fuse_argv[0] = argv[0];
+    for (int i = fuse_args_start; i < argc; i++) {
+        fuse_argv[i - fuse_args_start + 1] = argv[i];
+    }
+
+    int fuse_argc = argc - fuse_args_start + 1;
+
+    // Initialize FUSE
+    int ret = fuse_main(fuse_argc, fuse_argv, &ops, NULL);
+    
+    // Cleanup
+    free(fuse_argv);
+    for (int i = 0; i < disk_count; i++) {
+        munmap(disk_mmap[i], disk_size[i]);
+    }
+
+    return ret;
 }
