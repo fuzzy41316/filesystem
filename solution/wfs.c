@@ -1,17 +1,29 @@
 #define FUSE_USE_VERSION 30
+#include "wfs.h"
 #include <fuse.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <fcntl.h>
 #include <sys/mman.h>
-#include "wfs.h"
+#include <stdbool.h>
 
 #define MAX_DISKS 10  // Maximum number of disks supported
+
+// RAID modes
+typedef enum {
+    RAID_UNKNOWN = -1,
+    RAID_0 = 0,
+    RAID_1 = 1,
+    RAID_1V = 2
+} raid_mode_t;
+
 
 // Global variables for disks
 int raid_mode = -1;
@@ -23,21 +35,166 @@ void *disk_mmap[MAX_DISKS];
 // Superblock
 struct wfs_sb *superblock = NULL;
 
-// Function to read the superblock from the disks
-int read_superblock() 
-{
-    // Read superblock from the first disk
-    superblock = (struct wfs_sb *)disk_mmap[0];
+///////////////////////
+// HELPER FUNCTIONS //
+/////////////////////
+int get_inode_from_path(const char *path);
+struct wfs_dentry *get_directory_entry(const int block_num);
+struct wfs_inode *get_inode(const int inode_num);
+bool is_bitmap_set(char *bitmap, off_t index);
 
-    // Validate superblock and RAID mode
-    if (superblock->num_disks != disk_count) 
-    {
-        fprintf(stderr, "Error: Incorrect number of disks.\n");
-        return -1;
-    }
-    raid_mode = superblock->raid_mode;
-    return 0;
+/* Given the index and bitmap, check if the bitmap is non-null */
+bool is_bitmap_bit_set(char *bitmap, off_t index)
+{
+    return ((bitmap[index / 8] & (1 << (index % 8))) != 0);
 }
+
+/* From a block number, get the directory entry */
+struct wfs_dentry *get_directory_entry(const int block_num)
+{
+    return (struct wfs_dentry *)((char *)disk_mmap[0] + superblock->d_blocks_ptr + block_num * BLOCK_SIZE);
+}
+
+/* Given a path, get the inode number*/
+int get_inode_from_path(const char *path)
+{
+    // Make sure path is non-zero
+    if (strlen(path) == 0)
+    {
+        printf("Error: Path is empty\n");
+        return -ENOENT;
+    } 
+
+    // Make sure path is not the root
+    if(strcmp(path, "/") == 0)
+    {
+        printf("Error: Path is root\n");
+        return -EEXIST;
+    } 
+
+    // Duplicate path to tokenize without modifying original
+    char *path_copy = strdup(path);
+
+    // Find the final slash to identify the final file/directory
+    char *final_slash = strrchr(path_copy, '/');
+
+    // Seperate parent path and targetname
+    if (final_slash == path_copy)
+        *(final_slash + 1) = '\0';  // Parent is the root directory
+    else
+        *final_slash = '\0';
+
+    char *parent_path = path_copy;
+    char *target_name = final_slash + 1;
+
+    // Initialize variables to traverse the path
+    struct wfs_inode *current_inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr);
+    int current_inode_num = 0;  // Start from root inode
+
+    // Tokenize the parent path, and then traverse each component
+    char *token;
+    char *rest = parent_path;
+    for (token = __strtok_r(rest, "/", &rest); token != NULL; token = __strtok_r(NULL, "/", &rest))
+    {
+        int found = 0;
+
+        // Iterate over blocks of current directory
+        for (int i = 0; i < N_BLOCKS; i++)
+        {
+            if (current_inode->blocks[i] == 0)
+                continue;   // Skip if unused
+            
+            // Otherwise get directory entries in the current block
+            struct wfs_dentry *entries = get_directory_entry(current_inode->blocks[i]);
+            
+            // Skip over emppty directory entries
+            if (entries == NULL)
+                continue;
+
+            // Now iterate over each directory in the block
+            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+            {
+                if (entries[j].num == 0)
+                    continue;   // Skip if empty directory entry
+                
+                // Compares entry with token
+                if (strcmp(entries[j].name, token) == 0)
+                {
+                    // Found the entry
+                    current_inode_num = entries[j].num;
+                    current_inode = get_inode(current_inode_num);
+
+                    if (current_inode == NULL)
+                    {
+                        free(path_copy);
+                        printf("Error: Inode number %d is invalid\n", current_inode_num);
+                        return -ENOENT;
+                    }
+
+                    // Found the matching entry, exit loop
+                    found = 1;  
+                    break;
+                }
+            }
+
+            // Exit block loop, entry found
+            if (found)
+                break;
+        }
+    }
+
+    // After traversing the parent path, search for the target entry
+    for (int i = 0; i < N_BLOCKS; i++)
+    {
+        if (current_inode->blocks[i] == 0)
+            continue;   // Skip if unused
+
+        struct wfs_dentry *entries = get_directory_entry(current_inode->blocks[i]);
+
+        if (entries == NULL)
+            continue;   // Skip if empty
+        
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+        {
+            if (entries[j].num == 0)
+                continue;   // Skip if empty
+
+            if (strcmp(entries[j].name, target_name) == 0)
+            {
+                // Found the target entry
+                current_inode_num = entries[j].num;
+
+                // Make sure inode is allocated 
+                char *inode_bitmap = (char *)((char *)disk_mmap[0] + superblock->i_bitmap_ptr);
+
+                if (!is_bitmap_bit_set(inode_bitmap, current_inode_num))
+                {
+                    free(path_copy);
+                    printf("Error: Inode number %d is not allocated\n", current_inode_num);
+                    return -ENOENT;
+                }
+
+                free(path_copy);
+                return current_inode_num; // Success return inode number
+            }   
+        }
+    }
+
+    // If target entry is not found
+    free(path_copy);
+    printf("Error: Target entry %s not found\n", target_name);  
+    return -ENOENT;
+
+}
+/* Get the inode from the inode_number */
+struct wfs_inode * get_inode(const int inode_num)
+{
+    return (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + inode_num * sizeof(struct wfs_inode));
+}
+
+//////////////////////////////
+// END OF HELPER FUNCTIONS //
+////////////////////////////
 
 /*
  * Return file attributes. The "stat" structure is described in detail in the stat(2) manual page. For the given pathname, this should fill in the elements of the "stat" structure. 
@@ -45,16 +202,24 @@ int read_superblock()
 */
 static int wfs_getattr(const char *path, struct stat *stbuf) 
 {
-    // Implement file attribute logic here
-    memset(stbuf, 0, sizeof(struct stat));
-    if (strcmp(path, "/") == 0) {
-        // Root directory
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2;
-    } else {
-        // Implement lookup for other files and directories
+    // Translate the path to an inode number (wfs_inode->num)
+    int inode_num = get_inode_from_path(path);
+    if (inode_num == -ENOENT)
         return -ENOENT;
-    }
+
+    // with the inode number, get the correct inode
+    struct wfs_inode *inode = get_inode(inode_num);
+
+    // Fil the stat structure
+    stbuf->st_mode = inode->mode; 
+    stbuf->st_uid = inode->uid;
+    stbuf->st_gid = inode->gid;
+    stbuf->st_size = inode->size;
+    stbuf->st_nlink = inode->nlinks;
+    stbuf->st_atime = inode->atim;
+    stbuf->st_mtime = inode->mtim;
+    stbuf->st_ctime = inode->ctim;
+
     return 0;
 }
 
@@ -62,7 +227,8 @@ static int wfs_getattr(const char *path, struct stat *stbuf)
  * Make a special (device) file, FIFO, or socket. See mknod(2) for details. This function is rarely needed, since it's uncommon to make these objects inside special-purpose filesystems.
  *
 */ 
-static int wfs_mknod(const char *path, mode_t mode, dev_t rdev) {
+static int wfs_mknod(const char *path, mode_t mode, dev_t rdev) 
+{
     // Implement file creation logic here
     return -ENOSYS;
 }
@@ -70,15 +236,17 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev) {
 /*
  * Create a directory with the given name. The directory permissions are encoded in mode. See mkdir(2) for details. This function is needed for any reasonable read/write filesystem.
 */
-static int wfs_mkdir(const char *path, mode_t mode) {
-    // Implement directory creation logic here
-    return -ENOSYS;
+static int wfs_mkdir(const char *path, mode_t mode) 
+{
+
+    return 0;
 }
 
 /* 
  * Remove (delete) the given file, symbolic link, hard link, or special node. Note that if you support hard links, unlink only deletes the data when the last hard link is removed. See unlink(2) for details.
 */
-static int wfs_unlink(const char *path) {
+static int wfs_unlink(const char *path) 
+{
     // Implement file deletion logic here
     return -ENOSYS;
 }
@@ -86,7 +254,8 @@ static int wfs_unlink(const char *path) {
 /*
  * Remove the given directory. This should succeed only if the directory is empty (except for "." and ".."). See rmdir(2) for details.
 */
-static int wfs_rmdir(const char *path) {
+static int wfs_rmdir(const char *path) 
+{
     // Implement directory deletion logic here
     return -ENOSYS;
 }
@@ -95,7 +264,8 @@ static int wfs_rmdir(const char *path) {
  * Read sizebytes from the given file into the buffer buf, beginning offset bytes into the file. See read(2) for full details. 
  * Returns the number of bytes transferred, or 0 if offset was at or beyond the end of the file. Required for any sensible filesystem.
 */
-static int wfs_read(const char* path, char *buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+static int wfs_read(const char* path, char *buf, size_t size, off_t offset, struct fuse_file_info* fi) 
+{
     // Implement file read logic here
     return -ENOSYS;
 }
@@ -103,7 +273,8 @@ static int wfs_read(const char* path, char *buf, size_t size, off_t offset, stru
 /*
  * As for read above, except that it can't return 0.
 */
-static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) 
+{
     // Implement file write logic here
     return -ENOSYS;
 }
@@ -123,57 +294,9 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
  * Typically, it's simply the byte offset (within your directory layout) of the directory entry, but it's really up to you.
  * It's also important to note that readdir can return errors in a number of instances; in particular it can return -EBADF if the file handle is invalid, or -ENOENT if you use the path argument and the path doesn't exist.
 */
-static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
-    if (strcmp(path, "/") != 0) return -ENOENT;
-    filler(buf, ".", NULL, 0);
-    filler(buf, "..", NULL, 0);
-    return 0;
-}
-
-/*
- * Initialize the filesystem. This function can often be left unimplemented, but it can be a handy way to perform one-time setup such as allocating variable-sized data structures or initializing a new filesystem. 
- * The fuse_conn_info structure gives information about what features are supported by FUSE, and can be used to request certain capabilities 
- * (see below for more information). The return value of this function is available to all file operations in the private_data field of fuse_context. 
- * It is also passed as a parameter to the destroy() method.
-*/
-static void *wfs_init(struct fuse_conn_info *conn) 
+static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) 
 {
-    // Map the disk images into memory
-    for (int i = 0; i < disk_count; i++) 
-    {
-        int fd = open(disk_files[i], O_RDWR);
-        if (fd < 0) {
-            perror("open");
-            exit(1);
-        }
-        struct stat st;
-        if (fstat(fd, &st) < 0) 
-        {
-            perror("fstat");
-            exit(1);
-        }
-        disk_size[i] = st.st_size;
-        disk_mmap[i] = mmap(NULL, disk_size[i], PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (disk_mmap[i] == MAP_FAILED) 
-        {
-            perror("mmap");
-            exit(1);
-        }
-        close(fd);
-    }
-
-    if (read_superblock() < 0) exit(1);
-
-    return NULL;
-}
-
-/*
- * Called when the filesystem exits. The private_data comes from the return value of init.
-*/
-static void wfs_destroy(void *private_data) 
-{
-    // Unmap the disk images from memory
-    for (int i = 0; i < disk_count; i++) if (munmap(disk_mmap[i], disk_size[i]) < 0) perror("munmap");
+    return -ENOSYS;
 }
 
 
@@ -187,42 +310,41 @@ static struct fuse_operations ops = {
     .read    = wfs_read,
     .write   = wfs_write,
     .readdir = wfs_readdir,
-    .init    = wfs_init,
-    .destroy = wfs_destroy,
 };
 
 
-int main(int argc, char *argv[]) {
-    // Process arguments to extract disk files and FUSE options
+int main(int argc, char *argv[]) 
+{
+    // Extract disk files from arguments
     int fuse_argc = 0;
-    char *fuse_argv[argc + 1]; // +1 for the program name
-    fuse_argv[fuse_argc++] = argv[0]; // Program name
+    char *fuse_argv[argc + 1]; // +1 for NULL terminator
+    disk_count = 0;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "-f") == 0) {
-            fuse_argv[fuse_argc++] = argv[i];
-        } else if (strncmp(argv[i], "-", 1) != 0) {
-            // Assume it's a disk file or mount point
-            if (disk_count < MAX_DISKS) {
-                disk_files[disk_count++] = argv[i];
-            } else {
-                fprintf(stderr, "Error: Too many disks.\n");
-                return -1;
-            }
-        } else {
-            // Pass other FUSE options
-            fuse_argv[fuse_argc++] = argv[i];
+    // Assume the first arguments are disk files until we encounter a FUSE option (starting with '-')
+    int i = 1; // argv[0] is program name
+    while (i < argc && argv[i][0] != '-') 
+    {
+        if (disk_count < MAX_DISKS) disk_files[disk_count++] = argv[i++];
+        else 
+        {
+            fprintf(stderr, "Error: Too many disks.\n");
+            exit(1);
         }
     }
 
-    if (disk_count < 2) {
+    if (disk_count < 2) 
+    {
         fprintf(stderr, "Error: Not enough disks.\n");
-        return -1;
+        exit(1);
     }
 
-    // Make sure to null-terminate the fuse_argv array
+    // Prepare FUSE arguments
+    fuse_argv[fuse_argc++] = argv[0]; // Program name
+    while (i < argc) fuse_argv[fuse_argc++] = argv[i++];
+
+    // Null-terminate the fuse_argv array
     fuse_argv[fuse_argc] = NULL;
 
-    // Initialize FUSE with specified operations
+    // Call fuse_main with FUSE options and mount point
     return fuse_main(fuse_argc, fuse_argv, &ops, NULL);
 }
