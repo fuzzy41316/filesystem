@@ -47,6 +47,17 @@ int get_empty_inode();
 void set_bitmap_bit(char *bitmap, off_t index);
 static int add_directory_entry(struct wfs_inode *inode_ptr, const char *name, int inode_num, time_t curr_time);
 static int allocate_data_block();
+static int is_directory(int inode_idx);
+
+/* Check if the given inode from the inode index is a directory or other file */
+static int is_directory(int inode_idx)
+{
+    if (inode_idx < 0 || inode_idx >= superblock->num_inodes)
+        return 0;   // Not a directory
+
+    struct wfs_inode *inode = get_inode(inode_idx);
+    return (inode->mode & S_IFDIR) != 0;
+}
 
 /* Given a block, allocate date for it */
 static int allocate_data_block()
@@ -458,7 +469,35 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
 */
 static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) 
 {
-    return -ENOSYS;
+    // Find first directory
+    int inode_idx = get_inode_from_path(path);
+    if (inode_idx < 0)
+        return -ENOENT; // Not found
+    if (!is_directory(inode_idx))
+        return -ENOTDIR; // Not a directory
+
+    // Call filler function with the directory entries
+    struct wfs_inode *inode = get_inode(inode_idx);
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    // Iterate over the blocks of the directory
+    for (int i = 0; i < N_BLOCKS; i++)
+    {
+        if (inode->blocks[i] == 0)
+            continue;   // Skip if unused
+
+        struct wfs_dentry *entries = get_directory_entry(inode->blocks[i]);
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+        {
+            if (entries[j].num == 0)
+                continue;   // Skip if empty
+
+            filler(buf, entries[j].name, NULL, 0);
+        }   
+    }
+
+    return 0;   // Success
 }
 
 
