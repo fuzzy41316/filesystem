@@ -549,8 +549,42 @@ static int wfs_unlink(const char *path)
 */
 static int wfs_rmdir(const char *path) 
 {
-    // Implement directory deletion logic here
-    return -ENOSYS;
+    // Check that path is not current directory (. and ..)
+    char *final_slash = strchr(path, '/');
+    if (final_slash != NULL && strcmp(final_slash + 1, ".") == 0)
+        return -EINVAL; // Error if path is current directory
+    
+    // Get the directory inode index to remove
+    int directory_inode_num = get_inode_from_path(path);
+
+    if (directory_inode_num < 0)
+        return -ENOENT; // Not found
+
+    // Get the inode pointer for directory
+    struct wfs_inode *directory_inode_ptr = get_inode(directory_inode_num);
+
+    // Make sure that the directory is writable before editing
+    if (!(directory_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // Not writable
+    
+    // Iterate through data blocks to find the directory entries to remove
+    for (int i = 0; i < D_BLOCK; i++)
+    {
+        if (directory_inode_ptr->blocks[i] == 0)
+            continue;   // Skip if unused
+        
+        clear_bitmap_bit((char *)disk_mmap[0] + superblock->d_bitmap_ptr, (directory_inode_ptr->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+    }
+
+    // Remove directory from parent directory
+    int res = remove_directory_entry(path);
+    if (res < 0)
+        return res; // Return error if directory entry not removed
+    
+    clear_bitmap_bit((char *)disk_mmap[0] + superblock->i_bitmap_ptr, directory_inode_num);
+
+
+    return 0;   // Success
 }
 
 /* 
