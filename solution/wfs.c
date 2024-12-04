@@ -846,12 +846,14 @@ static struct fuse_operations ops = {
 
 int main(int argc, char *argv[]) 
 {
+    printf("1");
     // Need at least 2 disks and a mount point
     if (argc < 4) {
         fprintf(stderr, "Usage: %s disk1 disk2 [FUSE options] mount_point\n", argv[0]);
         return 1;
     }
-
+    
+    printf("2");
     // Count disks by checking if arguments are disk files
     disk_count = 0;
     int fuse_args_start = 1;
@@ -862,31 +864,33 @@ int main(int argc, char *argv[])
         }
         disk_files[disk_count++] = argv[fuse_args_start++];
     }
+    printf("3");
 
     // Open and mmap all disk files
     for (int i = 0; i < disk_count; i++) {
         int fd = open(disk_files[i], O_RDWR);
-        if (fd < 0) {
-            fprintf(stderr, "Error: Cannot open disk file %s\n", disk_files[i]);
+        if (fd == -1) {
+            perror("Error opening file");
             return 1;
         }
+        printf("4");
 
-        // Get disk size
         struct stat st;
-        if (fstat(fd, &st) < 0) {
-            fprintf(stderr, "Error: Cannot stat disk file %s\n", disk_files[i]);
+        if (fstat(fd, &st) == -1) {
+            perror("Error getting file size");
             close(fd);
             return 1;
         }
-        disk_size[i] = st.st_size;
 
-        // mmap the disk
+        printf("5");
+        disk_size[i] = st.st_size;
         disk_mmap[i] = mmap(NULL, disk_size[i], PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (disk_mmap[i] == MAP_FAILED) {
-            fprintf(stderr, "Error: Cannot mmap disk file %s\n", disk_files[i]);
+            perror("Error mapping file into memory");
             close(fd);
             return 1;
         }
+        printf("6");
         close(fd); // Can close fd after mmap
     }
 
@@ -900,6 +904,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    printf("7");    
     // Set RAID mode from superblock
     raid_mode = superblock->raid_mode;
 
@@ -909,17 +914,20 @@ int main(int argc, char *argv[])
         return 1;
     }
     
+    printf("8");
     // Adjust fuse arguments - first arg should be program name
     fuse_argv[0] = argv[0];
     for (int i = fuse_args_start; i < argc; i++) {
         fuse_argv[i - fuse_args_start + 1] = argv[i];
     }
+    printf("9");
 
     int fuse_argc = argc - fuse_args_start + 1;
 
     // Initialize FUSE
     int ret = fuse_main(fuse_argc, fuse_argv, &ops, NULL);
     
+    printf("10");
     // Cleanup
     free(fuse_argv);
     for (int i = 0; i < disk_count; i++) {
