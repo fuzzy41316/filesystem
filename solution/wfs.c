@@ -41,7 +41,159 @@ struct wfs_sb *superblock = NULL;
 int get_inode_from_path(const char *path);
 struct wfs_dentry *get_directory_entry(const int block_num);
 struct wfs_inode *get_inode(const int inode_num);
-bool is_bitmap_set(char *bitmap, off_t index);
+bool is_bitmap_bit_set(char *bitmap, off_t index);
+static int create_new_entry(const char *path, mode_t mode);
+int get_empty_inode();
+void set_bitmap_bit(char *bitmap, off_t index);
+static int add_directory_entry(struct wfs_inode *inode_ptr, const char *name, int inode_num, time_t curr_time);
+static int allocate_data_block();
+
+/* Given a block, allocate date for it */
+static int allocate_data_block()
+{
+    // Get the data bitmap
+    char * d_bitmap = (char *)((char *)disk_mmap[0] + superblock->d_bitmap_ptr);
+
+    // Iterate through the superblocks number of data blocks
+    for (size_t i = 0; i < superblock->num_data_blocks; i++)
+    {
+        if (!is_bitmap_bit_set(d_bitmap, i))
+        {
+            // Set the bitmap bit
+            set_bitmap_bit(d_bitmap, i);
+            return (int)(i * BLOCK_SIZE) + (int)(superblock->d_blocks_ptr);
+        }   
+    }
+
+    return -ENOSPC; // No space
+}
+
+
+
+/* Given an inode, name, inode number, and the current time, add a directory entry */
+static int add_directory_entry(struct wfs_inode *inode_ptr, const char *name, int inode_num, time_t curr_time)
+{
+    // Iterate over the blocks of the inode
+    for (int i = 0; i < N_BLOCKS; i++)
+    {   
+        // If block is non-zero, then fill
+        if (inode_ptr->blocks[i] != 0)
+        {
+            // Find the directory entry
+            struct wfs_dentry *entries = get_directory_entry(inode_ptr->blocks[i]);
+
+            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+            {
+                if (entries[j].num == 0)
+                {
+                    // Found an empty entry
+                    if (strlen(entries[i].name) >= MAX_NAME)
+                        return -ENAMETOOLONG;  // Name too long
+
+                    // Assign the name, nunber, and modified time
+                    strcpy(entries[j].name, name);
+                    entries[j].num = inode_num;
+                    inode_ptr->mtim = curr_time;    // Modified time
+                    return 0;   // Success
+                }
+            }
+        }
+        else
+        {   
+            // Otherwise allocate date for the block
+            off_t block_num = allocate_data_block();
+
+            if (block_num == -ENOSPC)
+                return -ENOSPC; // No space in the block
+
+            inode_ptr->blocks[i] = block_num;   // Assign the block number
+            struct wfs_dentry *entries = get_directory_entry(block_num);
+
+            if (strlen(entries[0].name) >= MAX_NAME)
+                return -ENAMETOOLONG;  // Name too long
+
+            entries[0].num = inode_num;
+            inode_ptr->mtim = curr_time;    // Modified time
+            return 0;   // SUccess
+        }
+    }
+
+    // Failure if no space
+    return -ENOSPC;
+}
+
+/* Set the bitmap bit */
+void set_bitmap_bit(char *bitmap, off_t index)
+{
+    bitmap[index / 8] |= (1 << (index % 8));
+}
+
+/* Find an empty inode to use for a new entry */
+int get_empty_inode()
+{   
+    // Iterate through inodes in superblock to find an empty inode
+    for (size_t i = 0; i < superblock->num_inodes; i++)
+    {
+        // Inode node not set???
+        if (!is_bitmap_bit_set((char *)((char *)disk_mmap[0] + superblock->i_bitmap_ptr), i))
+        {
+            // Then set it
+            set_bitmap_bit((char *)((char *)disk_mmap[0] + superblock->i_bitmap_ptr), i);
+            return i;   // Success
+        }
+    }
+    return -1;  // Failure
+}
+
+/* Given the path and mode, create a new entry*/
+static int create_new_entry(const char *path, mode_t mode)
+{
+    // Get the parent directory's inode index
+    char parent_path[strlen(path) + 1]; // Make parent_path
+    strcpy(parent_path, path);          // Assign path as parent
+    char *final_slash = strchr(parent_path, '/'); // Find the final slash
+
+    if (final_slash == NULL)
+        return -EINVAL; // Error if no slash found
+
+    *final_slash = '\0'; // Null terminate the parent path
+    int parent_inode = get_inode_from_path(parent_path); // Get the parent inode
+
+    if (parent_inode < 0)
+        return -ENOENT; // Return error if parent inode is invalid
+    
+    // Ensure parent directory is writable
+    struct wfs_inode *parent_inode_ptr = get_inode(parent_inode);
+    if (!(parent_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // Return error if parent directory is not writable
+    
+    // Now find an empty inode to store
+    int new_inode_num = get_empty_inode();
+    if (new_inode_num < 0)
+        return -ENOSPC; // Return error if no empty inode found
+    
+    // Create a new inode for file / directory
+    struct wfs_inode *new_inode = get_inode(new_inode_num);
+    new_inode->num = new_inode_num;
+    new_inode->mode = mode;
+    new_inode->uid = getuid();
+    new_inode->gid = getgid();
+    new_inode->size = 0;    // Initially empty
+    new_inode->nlinks = 1;  // Initially one link
+
+    // Get the current time for last access, modification, and status change 
+    time_t current_time = time(NULL);
+    new_inode->atim = current_time;
+    new_inode->mtim = current_time;
+    new_inode->ctim = current_time; 
+
+    // Now add to the directory
+    if (add_directory_entry(parent_inode_ptr, final_slash + 1, new_inode_num, current_time) < 0)
+        return -ENOSPC; // Return error if no space in directory
+    
+    return 0; // Success
+}
+
 
 /* Given the index and bitmap, check if the bitmap is non-null */
 bool is_bitmap_bit_set(char *bitmap, off_t index)
@@ -229,8 +381,13 @@ static int wfs_getattr(const char *path, struct stat *stbuf)
 */ 
 static int wfs_mknod(const char *path, mode_t mode, dev_t rdev) 
 {
-    // Implement file creation logic here
-    return -ENOSYS;
+    int res;
+
+    // Some sort of error in creating entry, pipeline error code
+    if ((res = create_new_entry(path, mode)) != 0)
+        return res;
+
+    return 0;   // Success otherwise
 }
 
 /*
@@ -238,6 +395,11 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t rdev)
 */
 static int wfs_mkdir(const char *path, mode_t mode) 
 {
+    int res;
+
+    // Set directory flag
+    if ((res = create_new_entry(path, S_IFDIR | mode)) != 0)
+        return res;
 
     return 0;
 }
