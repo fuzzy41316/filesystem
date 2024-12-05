@@ -130,6 +130,7 @@ int main(int argc, char *argv[])
         if (fd < 0)
         {
             close(fd);
+            printf("Error opening file\n");
             return 255;
         }
 
@@ -138,12 +139,14 @@ int main(int argc, char *argv[])
         if (fstat(fd, &st) < 0)
         {
             close(fd);
+            printf("Error getting file size\n");
             return 255;
         }
         off_t required_size = data_region_offset + num_data_blocks * BLOCK_SIZE;
         if (st.st_size < required_size)
         {
             close(fd);
+            printf("Error: Disk image file is too small\n");
             return 255;
         }
 
@@ -151,6 +154,7 @@ int main(int argc, char *argv[])
         if (pwrite(fd, &sb, sizeof(struct wfs_sb), 0) != sizeof(struct wfs_sb))
         {
             close(fd);
+            printf("Error writing superblock\n");
             return 255;
         }
 
@@ -158,6 +162,7 @@ int main(int argc, char *argv[])
         if (pwrite(fd, ibitmap, i_bitmap_size, i_bitmap_offset) != i_bitmap_size)
         {
             close(fd);
+            printf("Error writing inode bitmap\n");
             return 255;
         }
 
@@ -165,6 +170,7 @@ int main(int argc, char *argv[])
         if (pwrite(fd, dbitmap, d_bitmap_size, d_bitmap_offset) != d_bitmap_size)
         {
             close(fd);
+            printf("Error writing data block bitmap\n");
             return 255;
         }
 
@@ -173,6 +179,7 @@ int main(int argc, char *argv[])
         if (pwrite(fd, &root_inode, sizeof(struct wfs_inode), root_inode_offset) != sizeof(struct wfs_inode))
         {
             close(fd);
+            printf("Error writing root inode\n");
             return 255;
         }
         close(fd);
