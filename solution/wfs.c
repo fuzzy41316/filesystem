@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -56,65 +57,249 @@ static int wfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
 // HELPER FUNCTIONS //
 /////////////////////
 int get_inode_num(const char *path);
+static int create_new_entry(const char *path, mode_t mode);
+struct wfs_inode *get_inode_from_num(int inode_num);
+struct wfs_dentry *get_directory_entry(int block_number);
+void set_bitmap_bit(char *bitmap, off_t index);
+void clear_bitmap_bit(char *bitmap, off_t offset);
+bool is_bitmap_bit_set(char *bitmap, off_t index);
+static int allocate_data_block();
 
+// Helper function to allocate a new data block
+static int allocate_data_block()
+{
+    // Get the data bitmap from the d_bitmap ptr + offset
+    char *data_bitmap = (char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0];
 
-
-int get_inode_num(const char *path)
-{   
-    // Make sure path is non-zero
-    if (strlen(path) == 0)
-        return 0;
-
-    // Check if path is root
-    if (strcmp(path, "/") == 0)
-        return 0;   // Return 0 because root inode is always 0, and the offset is 0 when returned
-    
-    // Otherwise traverse the path /a/b/c for example to find the inode
-    char *token;    // Delimiter for /
-    char *path_copy = strdup(path); // Copy of path to modify
-    char *final_slash = strrchr(path_copy, '/'); // Find final slash
-    int inode_num = -1;  // Inode number to return
-
-    // Assume superblock used is from first disk
-    struct wfs_inode *inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr);
-
-    while ((token = strtok(path_copy, "/")) != NULL)
+    // Iterate through a superblocks data blocks to find one that is not set
+    for (size_t i = 0; i < superblock->num_data_blocks; i++)
     {
-        // Find the inode number in the directory
-        int found = 0;
-        for (int i = 0; i < N_BLOCKS; i++)
-        {   
-            // Ignore if empty
-            if (inode->blocks[i] == 0)
-                continue;
+        if (!is_bitmap_bit_set(data_bitmap, i))
+        {
+            set_bitmap_bit(data_bitmap, i);
+            return (int)(i * BLOCK_SIZE) + (int)(superblock->d_blocks_ptr); // Return the block number
+        }
+    }
+    return -ENOSPC; // No space left on device
+}
 
-            // Iterate through directory entries in the block
-            struct wfs_dentry *dentry = (struct wfs_dentry *)((char *)disk_mmap[0] + inode->blocks[i]);
+// Helper function to set a bit in a bitmap
+void set_bitmap_bit(char *bitmap, off_t index)
+{
+    bitmap[index / 8] |= (1 << (index % 8));    // Set the flag at the index
+}
+
+// Helper function to clear a bit in a bitmap
+void clear_bitmap_bit(char *bitmap, off_t offset)
+{
+    bitmap[offset / 8] &= ~(1 << (offset % 8));  // Clear the flag at the offset
+}
+
+// Helper function to check if a bit is set in a bitmap
+bool is_bitmap_bit_set(char *bitmap, off_t index)
+{
+    if (bitmap[index/8] & (1 << (index % 8))) // Check if the flag is set
+        return true;
+    else return false;
+}
+
+// Helper function to get an inode from an inode number
+struct wfs_inode *get_inode_from_num(int inode_num)
+{
+    struct wfs_inode *inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (inode_num * BLOCK_SIZE));
+    return inode;
+}
+
+// Helper function to get a directory entry from a block number
+struct wfs_dentry *get_directory_entry(int block_number)
+{
+    struct wfs_dentry *dentry = (struct wfs_dentry *)((char *)disk_mmap[0] + block_number);
+    return dentry;
+}
+
+
+// Helper function to create a new entry in the filesystem
+static int create_new_entry(const char *path, mode_t mode)
+{
+    printf("Creating new entry with path: %s\n", path); // Debugging statement
+
+    // Get the parent's directory inode index
+    char parent_path[strlen(path) + 1];
+    strcpy(parent_path, path);
+    char *final_slash = strrchr(parent_path, '/');
+
+    if (final_slash == NULL)
+        return -EINVAL; // Invalid path
+    
+    *final_slash = '\0'; // NULL terminate the parent path
+    int parent_inode = get_inode_num(parent_path);
+    if (parent_inode < 0)
+        return -ENOENT; // Parent inode does not exist
+
+    // Ensure that the directory is writable
+    struct wfs_inode *parent_inode_ptr = get_inode_from_num(parent_inode);
+    if (!(parent_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // No write permission
+    
+    printf("Trying to find an empty inode for new entry\n");
+    // Find an empty inode 
+    int new_inode_num = -1;
+    for (size_t i = 0; i < superblock->num_inodes; i++)
+    {
+        if (!is_bitmap_bit_set((char *)((off_t)disk_mmap[0] + superblock->i_bitmap_ptr), i))
+        {
+            set_bitmap_bit((char *)((off_t)disk_mmap[0] + superblock->i_bitmap_ptr), i);
+            new_inode_num = i;
+            break;
+        }
+    }
+    printf("Found empty inode: %d\n", new_inode_num);
+
+    if (new_inode_num < 0)
+        return -ENOSPC; // No space left on device
+
+    // Create a new inode for the directory
+    struct wfs_inode *new_inode = get_inode_from_num(new_inode_num);
+    new_inode->num = new_inode_num;
+    new_inode->mode = mode;
+    new_inode->uid = getuid();
+    new_inode->gid = getgid();
+    new_inode->size = 0;    // Initially zero because there's nothing in it
+    new_inode->nlinks = 1;  // Initially one because it's the first link
+    new_inode->atim = time(NULL);
+    new_inode->mtim = time(NULL);
+    new_inode->ctim = time(NULL);
+
+    printf("Trying to add new inode to parent directory\n");
+    // Now add the inode to the directory
+    int found = 0;
+    for (int i = 0; i < N_BLOCKS; i++)
+    {
+        // Handle an existing block
+        if (parent_inode_ptr->blocks[i] != 0)
+        {
+            printf("Parent inode has existing block\n");
+            struct wfs_dentry *dentries = get_directory_entry(parent_inode_ptr->blocks[i]);
             for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
             {
-                // Entry matches name
-                if (strcmp(dentry[j].name, token) == 0)
+                if (dentries[j].num == 0)
                 {
-                    // Make sure it's the last token (finalslash)
-                    if (strcmp(final_slash + 1, dentry[j].name) == 0)
-                    {
-                        found = 1;
-                        inode_num = dentry[j].num;
-                        break;
-                    }
-
+                    if (snprintf(dentries[j].name, MAX_NAME, "%s", final_slash + 1) >= MAX_NAME)
+                        return -ENAMETOOLONG; // Name too long
+                    dentries[j].num = new_inode_num;
+                    parent_inode_ptr->mtim = time(NULL);
+                    found = 1 ;
+                    break;
+                    printf("Added new inode to parent directory for existing block\n");
                 }
             }
             if (found)
                 break;
         }
+        // Otherwise allocate a new data block for the inode
+        else
+        {
+            printf("Parent inode does not have existing block\n");
+            printf("Allocating new data block for parent inode\n");
 
-        // If not found, return error
-        if (!found)
-            return -ENOENT;
+            off_t block_num = allocate_data_block();
+            if (block_num < 0)
+                return -ENOSPC; // No space left on device
+            printf("Allocated new data block for parent inode: %ld\n", block_num);
+
+            parent_inode_ptr->blocks[i] = block_num;
+            struct wfs_dentry *dentries = get_directory_entry(block_num);
+            if (snprintf(dentries[0].name, MAX_NAME, "%s", final_slash + 1) >= MAX_NAME)
+                return -ENAMETOOLONG; // Name too long
+            dentries[0].num = new_inode_num;
+            parent_inode_ptr->mtim = time(NULL);
+            found = 1;
+            printf("Added new inode to parent directory for new block\n");
+        }
+        if (found)
+            break;
     }
 
-    return inode_num;
+    if (found < 0)
+        return -ENOSPC; // No space left on device
+    else return 0;
+}
+
+
+
+int get_inode_num(const char *path)
+{
+    if (strlen(path) == 0)
+    {
+        return 0;
+    }
+
+    if (strcmp(path, "/") == 0)
+    { // Root inode
+        printf("returned root\n");
+        return 0;
+    }
+
+    // Traverse the path to find the corresponding inode
+    char *token;
+    char *path_copy = strdup(path);
+    if (path_copy == NULL)
+    {
+        printf("Memory allocation failed for path copy.\n");
+        return -ENOMEM; // Use standard error code for no memory
+    }
+    int final_found = 0;
+    int found = 0;
+    int inodeIndex = 0; // Start from the root inode
+                        //   int subInodes[D_BLOCK] = {0};
+    char *last_slash = strrchr(path, '/');
+    struct wfs_inode *inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr);
+    while ((token = strtok_r(path_copy, "/", &path_copy)))
+    {
+        found = 0;
+        printf("Processing token: %s\n", token);
+        for (int i = 0; i < N_BLOCKS; i++)
+        {
+            if (inode->blocks[i] != 0)
+            {
+                struct wfs_dentry *entry = get_directory_entry(inode->blocks[i]);
+                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+                {
+                    printf("Comparing Entry:%s Token:%s\n", entry[j].name, token);
+                    if (strcmp(entry[j].name, token) == 0)
+                    {
+                        if (strcmp(last_slash + 1, entry[j].name) == 0)
+                        {
+                            final_found = 1;
+                        }
+                        printf("Match found for entry: %s\n", entry[j].name);
+                        inode = get_inode_from_num(entry[j].num);
+                        inodeIndex = entry[j].num;
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (found == 1)
+                break;
+        }
+        if (final_found == 1)
+            break;
+        
+    }
+    if (found == 0 || final_found == 0 || !is_bitmap_bit_set((char *)(superblock->i_bitmap_ptr + (off_t)disk_mmap[0]), inode->num))
+    {
+        printf("Inode not found or invalid.\n");
+        return -ENOENT;
+    }
+
+    printf("Inode details:\n");
+    printf("Inode number: %d\n", inode->num);
+    printf("Inode mode: %d\n", inode->mode);
+    printf("Inode links: %d\n", inode->nlinks);
+    printf("Inode size: %ld\n", inode->size);
+    // free(path_copy);
+    return inodeIndex;
 }
 
 
@@ -168,6 +353,11 @@ static int wfs_getattr(const char* path, struct stat* stbuf)
 static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
 {
     printf("wfs_mknod called with path: %s\n", path);       // Debugging statement
+
+    int res = create_new_entry(path, mode);
+    if (res < 0)
+        return res;
+    
     return 0;
 }
 
@@ -184,56 +374,12 @@ static int wfs_mkdir(const char* path, mode_t mode)
 {
     printf("wfs_mkdir called with path: %s\n", path);       // Debugging statement
 
-    // Get the parents inode number from the path
-    char parent_path[strlen(path) + 1];
-    strcpy(parent_path, path);
-    char *final_slash = strrchr(parent_path, '/');
-
-    // There needs to be at least one parent directory (or root)
-    if (final_slash == NULL)
-        return -ENOENT; // No parent directory
-
-    *final_slash = '\0';    // For null terminating the parent path
-
-    int parent_inode_num = get_inode_num(parent_path);
-    if (parent_inode_num < 0)
-        return -ENOENT; // Parent inode does not exist
     
-    // Make sure we can write to the parent before creating a directory under it
-    struct wfs_inode *parent_inode_ptr = ((struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (parent_inode_num * BLOCK_SIZE)));
-
-    if (!(parent_inode_ptr->mode & S_IWUSR))
-        return -EACCES; // No write permission
-
-    int new_inode_num = -1; // New inode number for the directory
-    // Now find an empty inode if writable, by iterating through inodes in the superblock
-    for (size_t i = 0; i < superblock->num_inodes; i++)
-    {
-        // Check if bitmap is set or not
-        if ((((char *)(superblock->i_bitmap_ptr + (off_t)disk_mmap[0]))[i/8] & (1 << (i % 8))) != 0)
-            continue;   // Inode is in use
-
-        // Otherwise set the bitmap
-        ((char *)(superblock->i_bitmap_ptr + (off_t)disk_mmap[0]))[i/8] |= (1 << (i % 8));
-        new_inode_num = i;
-    }
-
-    if (new_inode_num == -1)
-        return -ENOSPC; // No space for new inode
-
-    // Now create a new inode for the directory
-    struct wfs_inode *new_inode = ((struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (new_inode_num * BLOCK_SIZE)));
-    new_inode->num = new_inode_num;
-    new_inode->mode = mode | S_IFDIR; // Set mode to directory
-    new_inode->nlinks = 1; // One link to itself initially
-    new_inode->uid = getuid();
-    new_inode->gid = getgid();
-    new_inode->size = 0; // No size initially
-    new_inode->atim = time(NULL);
-    new_inode->mtim = time(NULL);
-    new_inode->ctim = time(NULL);
-
-    // Now add this inode to the directory 
+    printf("Attempting to create new directory: %s\n", path);
+    int res = create_new_entry(path, mode | S_IFDIR);
+    if (res < 0)
+        return res;
+    printf("Successfully created new directory: %s\n", path);
 
     return 0;
 }
@@ -294,6 +440,41 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
 static int wfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi)
 {
     printf("wfs_readdir called with path: %s\n", path);   // Debugging statement
+
+    // Get the inode index associated with the path
+    int inode_num = get_inode_num(path);
+    if (inode_num <0)
+        return -ENOENT; // Path does not exist
+
+    // Ensure given path is a directory
+    if (inode_num < 0 || inode_num >= superblock->num_inodes)
+        return -ENOENT; // Path does not exist
+
+    struct wfs_inode *inode = get_inode_from_num(inode_num);
+    if (!(inode->mode & S_IFDIR))
+        return -ENOTDIR; // Not a directory
+
+    // Now get the parent
+    struct wfs_inode *parent_inode = get_inode_from_num(inode_num);
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    for (int i = 0; i < N_BLOCKS; i++)
+    {
+        if (parent_inode->blocks[i] != 0)
+        {
+            struct wfs_dentry *dentries = get_directory_entry(parent_inode->blocks[i]);
+            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+            {
+                if (dentries[j].num != 0)
+                {
+                    filler(buf, dentries[j].name, NULL, 0);
+                    printf("Added directory entry: %s\n", dentries[j].name);
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
