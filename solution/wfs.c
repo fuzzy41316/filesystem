@@ -391,6 +391,51 @@ static int wfs_mkdir(const char* path, mode_t mode)
 static int wfs_unlink(const char* path)
 {
     printf("wfs_unlink called with path: %s\n", path);      // Debugging statement
+
+    int file_inode = get_inode_num(path);
+    if (file_inode < 0)
+        return -ENOENT; // File not found
+    
+
+    struct wfs_inode *file_inode_ptr = get_inode_from_num(file_inode);
+    // Ensure that the file is writable
+    if (!(file_inode_ptr->mode & S_IWUSR))    
+        return -EACCES; // File not writable
+
+    // Release data blocks associated with the file inode
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        if (file_inode_ptr->blocks[i] != 0)
+        {
+            // Clear the data block from the data bitmap
+            memset((char *)file_inode_ptr->blocks[i] + (off_t)disk_mmap[0], 0, BLOCK_SIZE);
+
+            clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (file_inode_ptr->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+            // Reset the data block in the inode
+            file_inode_ptr->blocks[i] = 0;
+        }
+    }
+    
+    // Clear the inode from the inode bitmap
+    if (file_inode_ptr->blocks[IND_BLOCK] != 0)
+    {
+        off_t *indirect = (off_t *)(file_inode_ptr->blocks[IND_BLOCK] + (off_t)disk_mmap[0]);
+
+        // Release data blocks associated with the file inode
+        for (size_t i = 0; i < BLOCK_SIZE / sizeof(off_t); i++)
+        {
+            if (indirect[i] == 0)
+                continue;   // Skip empty blocks
+
+            clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (indirect[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+            memset((char *)indirect[i] + (off_t)disk_mmap[0], 0, BLOCK_SIZE);
+        }
+
+        // Clear the indirect block from the data bitmap
+        memset(indirect, 0, BLOCK_SIZE);
+        clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (file_inode_ptr->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+    }
+
     return 0;
 }
 
@@ -400,6 +445,77 @@ static int wfs_unlink(const char* path)
 static int wfs_rmdir(const char* path)
 {
     printf("wfs_rmdir called with given directory: %s\n", path);       // Debugging statement
+
+    char *final_slash = strrchr(path, '/');
+    if (final_slash != NULL && strcmp(final_slash + 1, ".") == 0)
+        return -EINVAL; // Cannot remove current directory
+
+    // Get the inode index of the directory to remove
+    int dir_inode = get_inode_num(path);
+    if (dir_inode < 0)
+        return -ENOENT; // Directory does not exist
+
+    // Get the inode pointer from the inode number
+    struct wfs_inode *dir_inode_ptr = get_inode_from_num(dir_inode);
+
+    // Ensure that the directory is writable
+    if (!(dir_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // No write permission
+
+    // Iterate through data blocks of the directory, and clear any bitmap bits that are set
+    for (int i = 0; i < D_BLOCK; i++)
+    {
+        if (dir_inode_ptr->blocks[i] != 0)
+            clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (dir_inode_ptr->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE);
+    }
+
+    // Now remove the directory from the parent directory
+
+    // Get the parent path, and find the last last object (last slash)
+    char parent_path[strlen(path) + 1]; 
+    strcpy(parent_path, path);
+    char *last_slash = strrchr(parent_path, '/');
+    
+    if (last_slash == NULL)
+        return -EINVAL; // Invalid path
+
+    *last_slash = '\0'; // NULL terminate the parent path
+
+    int parent_inode = get_inode_num(parent_path);
+    if (parent_inode < 0)
+        return -ENOENT; // Parent inode does not exist
+
+    struct wfs_inode *parent_inode_ptr = get_inode_from_num(parent_inode);
+    if (!(parent_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // No write permission
+
+    int found = 0;
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        struct wfs_dentry *entries = get_directory_entry(parent_inode_ptr->blocks[i]);
+
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+        {
+            if (entries[j].num != 0)
+            {
+                if (strcmp(entries[j].name, last_slash + 1) == 0)
+                {
+                    entries[j].num = 0;
+                    memset(entries[j].name, 0, MAX_NAME);
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (found) break; // Exit the loop if the entry is found
+    }
+
+    if (!found)
+        return -ENOENT; // Entry not found
+
+    // Finally, clear the bitmap bit of the directory inode
+    clear_bitmap_bit((char *)superblock->i_bitmap_ptr + (off_t)disk_mmap[0], dir_inode);
+
     return 0;
 }
 
