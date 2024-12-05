@@ -150,7 +150,7 @@ static int wfs_getattr(const char* path, struct stat* stbuf)
 
     // Get inode from the number
     struct wfs_inode *inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (inode_num * BLOCK_SIZE));
-    
+
     stbuf->st_uid = inode->uid;
     stbuf->st_gid = inode->gid;
     stbuf->st_atime = inode->atim;
@@ -183,6 +183,58 @@ static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
 static int wfs_mkdir(const char* path, mode_t mode)
 {
     printf("wfs_mkdir called with path: %s\n", path);       // Debugging statement
+
+    // Get the parents inode number from the path
+    char parent_path[strlen(path) + 1];
+    strcpy(parent_path, path);
+    char *final_slash = strrchr(parent_path, '/');
+
+    // There needs to be at least one parent directory (or root)
+    if (final_slash == NULL)
+        return -ENOENT; // No parent directory
+
+    *final_slash = '\0';    // For null terminating the parent path
+
+    int parent_inode_num = get_inode_num(parent_path);
+    if (parent_inode_num < 0)
+        return -ENOENT; // Parent inode does not exist
+    
+    // Make sure we can write to the parent before creating a directory under it
+    struct wfs_inode *parent_inode_ptr = ((struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (parent_inode_num * BLOCK_SIZE)));
+
+    if (!(parent_inode_ptr->mode & S_IWUSR))
+        return -EACCES; // No write permission
+
+    int new_inode_num = -1; // New inode number for the directory
+    // Now find an empty inode if writable, by iterating through inodes in the superblock
+    for (size_t i = 0; i < superblock->num_inodes; i++)
+    {
+        // Check if bitmap is set or not
+        if ((((char *)(superblock->i_bitmap_ptr + (off_t)disk_mmap[0]))[i/8] & (1 << (i % 8))) != 0)
+            continue;   // Inode is in use
+
+        // Otherwise set the bitmap
+        ((char *)(superblock->i_bitmap_ptr + (off_t)disk_mmap[0]))[i/8] |= (1 << (i % 8));
+        new_inode_num = i;
+    }
+
+    if (new_inode_num == -1)
+        return -ENOSPC; // No space for new inode
+
+    // Now create a new inode for the directory
+    struct wfs_inode *new_inode = ((struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + (new_inode_num * BLOCK_SIZE)));
+    new_inode->num = new_inode_num;
+    new_inode->mode = mode | S_IFDIR; // Set mode to directory
+    new_inode->nlinks = 1; // One link to itself initially
+    new_inode->uid = getuid();
+    new_inode->gid = getgid();
+    new_inode->size = 0; // No size initially
+    new_inode->atim = time(NULL);
+    new_inode->mtim = time(NULL);
+    new_inode->ctim = time(NULL);
+
+    // Now add this inode to the directory 
+
     return 0;
 }
 
