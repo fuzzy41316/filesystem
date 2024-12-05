@@ -67,9 +67,12 @@ static int allocate_data_block();
 static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate);
 void allocate_raid1(void *disk_mmap[]);
 
+
+// Allocate all data and metadata blocks for RAID 1V
 void allocate_raid1(void *disk_mmap[])
 {
     // In RAID 1 or 1v, all data and metadata blocks are mirrored
+    // Disks have independent data bitmaps. This is consistent with what you have already implemented in mkfs.
     if (raid_mode == RAID_1 || raid_mode == RAID_1V)
     {
         // Copy superblock to all disks
