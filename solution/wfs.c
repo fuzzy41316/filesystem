@@ -65,6 +65,34 @@ void clear_bitmap_bit(char *bitmap, off_t offset);
 bool is_bitmap_bit_set(char *bitmap, off_t index);
 static int allocate_data_block();
 static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate);
+void allocate_raid1(void *disk_mmap[]);
+
+void allocate_raid1(void *disk_mmap[])
+{
+    // In RAID 1 or 1v, all data and metadata blocks are mirrored
+    if (raid_mode == RAID_1 || raid_mode == RAID_1V)
+    {
+        // Copy superblock to all disks
+        for (int i = 1; i < disk_count; i++)
+            memcpy(disk_mmap[i], disk_mmap[0], BLOCK_SIZE);
+
+        // Copy inode bitmap to all disks
+        for (int i = 1; i < disk_count; i++)
+            memcpy((char *)disk_mmap[i] + superblock->i_bitmap_ptr, (char *)disk_mmap[0] + superblock->i_bitmap_ptr, BLOCK_SIZE);
+
+        // Copy data bitmap to all disks
+        for (int i = 1; i < disk_count; i++)
+            memcpy((char *)disk_mmap[i] + superblock->d_bitmap_ptr, (char *)disk_mmap[0] + superblock->d_bitmap_ptr, BLOCK_SIZE);
+
+        // Copy inode blocks to all disks
+        for (int i = 1; i < disk_count; i++)
+            memcpy((char *)disk_mmap[i] + superblock->i_blocks_ptr, (char *)disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
+
+        // Copy data blocks to all disks
+        for (int i = 1; i < disk_count; i++)
+            memcpy((char *)disk_mmap[i] + superblock->d_blocks_ptr, (char *)disk_mmap[0] + superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+    }
+}
 
 static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate)
 {
@@ -309,7 +337,7 @@ static int create_new_entry(const char *path, mode_t mode)
 
     if (found < 0)
         return -ENOSPC; // No space left on device
-    else return 0;
+    return 0;
 }
 
 
@@ -444,6 +472,8 @@ static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
     int res = create_new_entry(path, mode);
     if (res < 0)
         return res;
+
+    allocate_raid1(disk_mmap);
     
     return 0;
 }
@@ -467,6 +497,8 @@ static int wfs_mkdir(const char* path, mode_t mode)
     if (res < 0)
         return res;
     printf("Successfully created new directory: %s\n", path);
+
+    allocate_raid1(disk_mmap);
 
     return 0;
 }
