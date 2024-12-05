@@ -555,6 +555,7 @@ static int wfs_unlink(const char* path)
         clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (file_inode_ptr->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE);
     }
 
+    allocate_raid1(disk_mmap);
     return 0;
 }
 
@@ -635,6 +636,8 @@ static int wfs_rmdir(const char* path)
     // Finally, clear the bitmap bit of the directory inode
     clear_bitmap_bit((char *)superblock->i_bitmap_ptr + (off_t)disk_mmap[0], dir_inode);
 
+    allocate_raid1(disk_mmap);
+
     return 0;
 }
 
@@ -697,6 +700,9 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
         curr_offset += bytes_to_copy;
     }
 
+    if (raid_mode == RAID_1)
+        allocate_raid1(disk_mmap);
+
     return bytes_read;
 }
 
@@ -733,6 +739,7 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
     size_t remaining_bytes = size;
     off_t curr_offset = offset;
 
+    printf("Writing data to file: %s\n", path);
     while (bytes_writen < size)
     {
         // Calculate the block index and offset within the block
@@ -744,7 +751,7 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
             return -EFBIG; // File too larg
 
         // Check if we need to read from an indirect block
-        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 0);
+        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 1);
         if (block_ptr == NULL)
             return -EIO; // Error, block pointer was not allocated
 
@@ -753,6 +760,7 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
         if (bytes_to_copy > remaining_bytes)
             bytes_to_copy = remaining_bytes;
 
+        printf("Writing data to block at index: %ld\n", block_index);
         memcpy(((char *)block_ptr + block_offset), buf + bytes_writen, bytes_to_copy);
 
         // Update the counters
@@ -760,6 +768,10 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
         remaining_bytes -= bytes_to_copy;
         curr_offset += bytes_to_copy;
     }
+
+    inode_ptr->mtim = time(NULL);
+    
+    allocate_raid1(disk_mmap);
 
     return bytes_writen;
 }
@@ -816,6 +828,8 @@ static int wfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
         }
     }
 
+    if (raid_mode == RAID_1)
+        allocate_raid1(disk_mmap);
     return 0;
 }
 
