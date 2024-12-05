@@ -64,6 +64,93 @@ void set_bitmap_bit(char *bitmap, off_t index);
 void clear_bitmap_bit(char *bitmap, off_t offset);
 bool is_bitmap_bit_set(char *bitmap, off_t index);
 static int allocate_data_block();
+static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate);
+
+static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate)
+{
+    printf("get_block_ptr: block_index = %ld, allocate = %d\n", block_index, allocate);
+
+    if (block_index < D_BLOCK)
+    {
+        // Direct block access
+        printf("Accessing direct block at index %ld\n", block_index);
+        if (file_inode_ptr->blocks[block_index] == 0 && allocate)
+        {
+            printf("Direct block not allocated, attempting to allocate...\n");
+            // Allocate a new data block if it's not already allocated
+            int dataIndex = allocate_data_block();
+            if (dataIndex == -ENOSPC)
+            {
+                printf("No space available for data block, returning NULL\n");
+                // No space available for data block
+                return NULL;
+            }
+            file_inode_ptr->blocks[block_index] = dataIndex;
+            printf("Allocated new data block at index %d\n", dataIndex);
+        }
+        else if (file_inode_ptr->blocks[block_index] == 0)
+            return NULL;
+        return (off_t *)(file_inode_ptr->blocks[block_index] + (off_t)disk_mmap[0]);
+    }
+    else
+    {
+        // Indirect block access
+        off_t indirect_block_index = block_index - D_BLOCK;
+        printf("Accessing indirect block at index %ld\n", indirect_block_index);
+        if (indirect_block_index >= BLOCK_SIZE / sizeof(off_t))
+        {
+            printf("Invalid block index, returning NULL\n");
+            // Invalid block index
+            return NULL;
+        }
+
+        // Check if the indirect block is allocated
+        if (file_inode_ptr->blocks[IND_BLOCK] == 0)
+        {
+            if (!allocate)
+            {
+                printf("Indirect block not allocated and allocation not allowed, returning NULL\n");
+                // Indirect block not allocated and we're not allowed to allocate
+                return NULL;
+            }
+
+            printf("Indirect block not allocated, attempting to allocate...\n");
+            // Allocate a new indirect block
+            int ind_block = allocate_data_block();
+            if (ind_block == -ENOSPC)
+            {
+                printf("No space available for indirect block, returning NULL\n");
+                // No space available for indirect block
+                return NULL;
+            }
+            file_inode_ptr->blocks[IND_BLOCK] = ind_block;
+            // Clear the new indirect block
+            memset((char *)((ind_block) + (off_t)disk_mmap[0]), 0, BLOCK_SIZE);
+            printf("Allocated new indirect block at index %d\n", ind_block);
+        }
+
+        // Get the pointer to the indirect block
+        off_t *indirect_block_ptr = (off_t *)((file_inode_ptr->blocks[IND_BLOCK]) + (off_t)disk_mmap[0]);
+
+        // Check if the entry within the indirect block is allocated, if not, allocate a new data block
+        if (indirect_block_ptr[indirect_block_index] == 0 && allocate)
+        {
+            printf("Indirect block entry not allocated, attempting to allocate...\n");
+            int dataIndex = allocate_data_block();
+            if (dataIndex == -ENOSPC)
+            {
+                printf("No space available for data block, returning NULL\n");
+                // No space available for data block
+                return NULL;
+            }
+            indirect_block_ptr[indirect_block_index] = dataIndex;
+            printf("Allocated new data block at index %d for indirect block\n", dataIndex);
+        }
+
+        // Point to the data block within the indirect block
+        return (off_t *)(indirect_block_ptr[indirect_block_index] + (off_t)disk_mmap[0]);
+    }
+}
 
 // Helper function to allocate a new data block
 static int allocate_data_block()
@@ -527,7 +614,58 @@ static int wfs_rmdir(const char* path)
 static int wfs_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
     printf("wfs_read called with path: %s\n", path);      // Debugging statement
-    return 0;
+
+    // Get the file inode index from the path
+    int inode_index = get_inode_num(path);
+    if (inode_index < 0)
+        return -ENOENT; // File does not exist
+    
+    // get the inode pointer from the number
+    struct wfs_inode *inode_ptr = get_inode_from_num(inode_index);
+    
+    // Ensure that the file is a regular file
+    if (!(inode_ptr->mode & S_IFREG))
+        return -EISDIR; // Not a regular file
+    
+    // Ensure the offset is within the size of the disk
+    if (offset >= inode_ptr->size)
+        return 0; // Offset is at or beyond the end of the file
+    
+    // May have to adjust size
+    size_t bytes_to_read = size;
+    if (offset + size > inode_ptr->size)
+        bytes_to_read = inode_ptr->size - offset;
+
+    // Now read data from the file (in bytes)
+    size_t bytes_read = 0;
+    size_t remaining_bytes = bytes_to_read;
+    off_t curr_offset = offset;
+
+    while (bytes_read < bytes_to_read)
+    {
+        // Calculate the block index and offset within the block
+        off_t block_index = curr_offset / BLOCK_SIZE;
+        off_t block_offset = curr_offset % BLOCK_SIZE;
+
+        // Check if we need to read from an indirect block
+        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 0);
+        if (block_ptr == NULL)
+            return -EIO; // Error, block pointer was not allocated
+
+        // Read data from the block
+        size_t bytes_to_copy = BLOCK_SIZE - block_offset;
+        if (bytes_to_copy > remaining_bytes)
+            bytes_to_copy = remaining_bytes;
+
+        memcpy(buf + bytes_read, ((char *)block_ptr + block_offset), bytes_to_copy);
+
+        // Update the counters
+        bytes_read += bytes_to_copy;
+        remaining_bytes -= bytes_to_copy;
+        curr_offset += bytes_to_copy;
+    }
+
+    return bytes_read;
 }
 
 /* 
@@ -536,7 +674,62 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
 static int wfs_write(const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
     printf("wfs_write called with path: %s\n", path);     // Debugging statement
-    return 1;
+
+    // Get the file inode index from the path
+    int inode_index = get_inode_num(path);
+    if (inode_index < 0)
+        return -ENOENT; // File does not exist
+    
+    // get the inode pointer from the number
+    struct wfs_inode *inode_ptr = get_inode_from_num(inode_index);
+    
+    // Ensure that the file is a regular file
+    if (!(inode_ptr->mode & S_IFREG))
+        return -EISDIR; // Not a regular file
+    
+    // Ensure the offset is within the size of the disk
+    if (offset > inode_ptr->size)
+        return -EFBIG; // Offset exceeds the file size
+    
+    // Calculate the new size of the file
+    off_t new_size = offset + size;
+    if (new_size > inode_ptr->size)
+        inode_ptr->size = new_size;
+
+    // Now write data to the file (in bytes)
+    size_t bytes_writen = 0;
+    size_t remaining_bytes = size;
+    off_t curr_offset = offset;
+
+    while (bytes_writen < size)
+    {
+        // Calculate the block index and offset within the block
+        off_t block_index = curr_offset / BLOCK_SIZE;
+        off_t block_offset = curr_offset % BLOCK_SIZE;
+
+        // Make sure file is not too small to write to
+        if (block_index >= N_BLOCKS + BLOCK_SIZE / sizeof(off_t))
+            return -EFBIG; // File too larg
+
+        // Check if we need to read from an indirect block
+        off_t *block_ptr = get_block_ptr(inode_ptr, block_index, 0);
+        if (block_ptr == NULL)
+            return -EIO; // Error, block pointer was not allocated
+
+        // Write data from the block
+        size_t bytes_to_copy = BLOCK_SIZE - block_offset;
+        if (bytes_to_copy > remaining_bytes)
+            bytes_to_copy = remaining_bytes;
+
+        memcpy(((char *)block_ptr + block_offset), buf + bytes_writen, bytes_to_copy);
+
+        // Update the counters
+        bytes_writen += bytes_to_copy;
+        remaining_bytes -= bytes_to_copy;
+        curr_offset += bytes_to_copy;
+    }
+
+    return bytes_writen;
 }
 
 /* 
