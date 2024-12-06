@@ -65,35 +65,61 @@ void clear_bitmap_bit(char *bitmap, off_t offset);
 bool is_bitmap_bit_set(char *bitmap, off_t index);
 static int allocate_data_block();
 static off_t *get_block_ptr(struct wfs_inode *file_inode_ptr, off_t block_index, int allocate);
-void allocate_raid1(void *disk_mmap[]);
+void allocate_raid(void *disk_mmap[]);
 
 
-// Allocate all data and metadata blocks for RAID 1V
-void allocate_raid1(void *disk_mmap[])
+// Allocate all data and metadata blocks based on RAID mode
+void allocate_raid(void *disk_mmap[])
 {
-    // In RAID 1 or 1v, all data and metadata blocks are mirrored
-    // Disks have independent data bitmaps. This is consistent with what you have already implemented in mkfs.
-    if (raid_mode == RAID_1 || raid_mode == RAID_1V)
+    // In RAID 1 or RAID 1V, all metadata blocks are mirrored
+    if (raid_mode != RAID_0)
     {
         // Copy superblock to all disks
         for (int i = 1; i < disk_count; i++)
+        {
             memcpy(disk_mmap[i], disk_mmap[0], BLOCK_SIZE);
+        }
 
         // Copy inode bitmap to all disks
         for (int i = 1; i < disk_count; i++)
-            memcpy((char *)disk_mmap[i] + superblock->i_bitmap_ptr, (char *)disk_mmap[0] + superblock->i_bitmap_ptr, BLOCK_SIZE);
-
-        // Copy data bitmap to all disks
-        for (int i = 1; i < disk_count; i++)
-            memcpy((char *)disk_mmap[i] + superblock->d_bitmap_ptr, (char *)disk_mmap[0] + superblock->d_bitmap_ptr, BLOCK_SIZE);
+        {
+            memcpy((char *)disk_mmap[i] + superblock->i_bitmap_ptr, 
+                   (char *)disk_mmap[0] + superblock->i_bitmap_ptr, BLOCK_SIZE);
+        }
 
         // Copy inode blocks to all disks
         for (int i = 1; i < disk_count; i++)
-            memcpy((char *)disk_mmap[i] + superblock->i_blocks_ptr, (char *)disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
+        {
+            memcpy((char *)disk_mmap[i] + superblock->i_blocks_ptr, 
+                   (char *)disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
+        }
 
         // Copy data blocks to all disks
         for (int i = 1; i < disk_count; i++)
-            memcpy((char *)disk_mmap[i] + superblock->d_blocks_ptr, (char *)disk_mmap[0] + superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+        {
+            memcpy((char *)disk_mmap[i] + superblock->d_blocks_ptr, 
+                   (char *)disk_mmap[0] + superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+        }
+    }
+    // Apply RAID 0 only to data blocks. Metadata remains mirrored.
+    else
+    {
+        // Mirror metadata across all disks
+        for (int i = 1; i < disk_count; i++)
+        {
+            // Mirror superblock
+            memcpy(disk_mmap[i], disk_mmap[0], BLOCK_SIZE);
+
+            // Mirror inode bitmap
+            memcpy((char *)disk_mmap[i] + superblock->i_bitmap_ptr, 
+                   (char *)disk_mmap[0] + superblock->i_bitmap_ptr, BLOCK_SIZE);
+
+            // Mirror inode blocks
+            memcpy((char *)disk_mmap[i] + superblock->i_blocks_ptr, 
+                   (char *)disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
+        }
+
+        // Data blocks are striped across disks (RAID 0), so no mirroring
     }
 }
 
@@ -188,7 +214,7 @@ static int allocate_data_block()
 {
     // Get the data bitmap from the d_bitmap ptr + offset
     char *data_bitmap = (char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0];
-
+    
     // Iterate through a superblocks data blocks to find one that is not set
     for (size_t i = 0; i < superblock->num_data_blocks; i++)
     {
@@ -476,7 +502,7 @@ static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
     if (res < 0)
         return res;
 
-    allocate_raid1(disk_mmap);
+    allocate_raid(disk_mmap);
     
     return 0;
 }
@@ -501,7 +527,7 @@ static int wfs_mkdir(const char* path, mode_t mode)
         return res;
     printf("Successfully created new directory: %s\n", path);
 
-    allocate_raid1(disk_mmap);
+    allocate_raid(disk_mmap);
 
     return 0;
 }
@@ -558,7 +584,7 @@ static int wfs_unlink(const char* path)
         clear_bitmap_bit((char *)superblock->d_bitmap_ptr + (off_t)disk_mmap[0], (file_inode_ptr->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE);
     }
 
-    allocate_raid1(disk_mmap);
+    allocate_raid(disk_mmap);
     return 0;
 }
 
@@ -639,7 +665,7 @@ static int wfs_rmdir(const char* path)
     // Finally, clear the bitmap bit of the directory inode
     clear_bitmap_bit((char *)superblock->i_bitmap_ptr + (off_t)disk_mmap[0], dir_inode);
 
-    allocate_raid1(disk_mmap);
+    allocate_raid(disk_mmap);
 
     return 0;
 }
@@ -704,7 +730,7 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
     }
 
     if (raid_mode == RAID_1)
-        allocate_raid1(disk_mmap);
+        allocate_raid(disk_mmap);
 
     return bytes_read;
 }
@@ -774,7 +800,7 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
 
     inode_ptr->mtim = time(NULL);
     
-    allocate_raid1(disk_mmap);
+    allocate_raid(disk_mmap);
 
     return bytes_writen;
 }
@@ -832,7 +858,7 @@ static int wfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     }
 
     if (raid_mode == RAID_1)
-        allocate_raid1(disk_mmap);
+        allocate_raid(disk_mmap);
     return 0;
 }
 
