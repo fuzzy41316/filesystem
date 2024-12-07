@@ -53,8 +53,8 @@ struct wfs_inode {
     off_t blocks[N_BLOCKS];
 };
 
-// Directory entry
+// Directory entry store in a data block
 struct wfs_dentry {
-    char name[MAX_NAME];
-    int num;
+    char name[MAX_NAME];    // Name of the directory entry
+    int num;                // Inode number of the directory entry
 };
