@@ -67,16 +67,16 @@ static int allocate_data_block();
 
 static int allocate_data_block()
 {
+    char *data_bitmap_ptr = (char *)disk_mmap[0] + superblock->d_bitmap_ptr;
     // Check if there's any available data blocks
     for (size_t i = 0; i < superblock->num_data_blocks; i++)
     {
         // Find an empty data block
-        if (!is_inode_set((char *)disk_mmap[0] + superblock->d_bitmap_ptr, i))
+        if (!is_inode_set(data_bitmap_ptr, i))
         {
             // Set the data block in the bitmap
-            set_inode_bitmap((char *)disk_mmap[0] + superblock->d_bitmap_ptr, i);
-            printf("Allocated data block: %ld\n", i);
-            return i;
+            set_inode_bitmap(data_bitmap_ptr, i);
+            return (int)(i * BLOCK_SIZE) + (int)(superblock->d_blocks_ptr); // Return the block number
         }
     }
     return -ENOSPC; // No available data blocks
@@ -106,6 +106,9 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
                         return -ENAMETOOLONG; // File name too long
                     dentry[j].num = child_inode->num;
                     strcpy(dentry[j].name, file_name);
+                    
+                    // Update parent inode modification time
+                    parent_inode->mtim = time(NULL);
                     return 1;
                 }
             }
@@ -117,14 +120,21 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
             off_t block_num = allocate_data_block();
             if (block_num < 0)
                 return -ENOSPC; // Return error generated from allocate_data_block()
-            printf("Allocated new data block for inode\n");
-            
+            printf("Allocated new data block for inode: %ld\n", block_num);
+
+            printf("Updating parent inode with new data block...\n");
             parent_inode->blocks[i] = block_num;
+
+            printf("parent_inode->blocks[%d] = %ld\n", i, parent_inode->blocks[i]);
             struct wfs_dentry *dentry = (struct wfs_dentry *)((char *)disk_mmap[0] + block_num);
             if (strlen(file_name) > MAX_NAME)
                 return -ENAMETOOLONG; // File name too long
+
+            printf("Updating directory: %s\n", file_name);
             dentry[0].num = child_inode->num;
             strcpy(dentry[0].name, file_name);
+
+            printf("Parent inode new entry: name: %s number: %i\n", dentry[0].name, dentry[0].num);
             return 1;
         }
     }
@@ -141,8 +151,10 @@ struct wfs_inode *allocate_inode(char *i_bitmap_ptr)
         if (!is_inode_set(i_bitmap_ptr, i))
         {
             // Set the inode in the bitmap
+            struct wfs_inode *inode = (struct wfs_inode *)(i_bitmap_ptr + i * BLOCK_SIZE);
+            inode->num = i;
             set_inode_bitmap(i_bitmap_ptr, i);
-            return (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr + i * BLOCK_SIZE);
+            return inode;
         }
     }
     return NULL; // No available inodes
@@ -186,7 +198,7 @@ struct wfs_inode *get_inode_from_path(const char* path)
     char *token = strtok(path_copy, "/"); // Get the first token
     while(token != NULL)
     {
-        printf("Checking directory: %s\n", path_copy);
+        printf("Checking directory: %s\n", token);
         // Check each block of the current_inode
         for (int i = 0; i < N_BLOCKS; i++)
         {
@@ -198,25 +210,34 @@ struct wfs_inode *get_inode_from_path(const char* path)
 
                 for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
                 {
-                    if (strcmp(dentry[j].name, path_copy) == 0)
+                    if (strcmp(dentry[j].name, token) == 0)
                     {
-                        printf("Found file in directory entry: %s\n", path_copy);
-                        
+                        printf("Found file in directory entry: %s\n", token);
+                        printf("Directory entry details:\n");
+                        printf("----------------\n");
+                        printf("    Name: %s\n", dentry[j].name);
+                        printf("    Num: %d\n", dentry[j].num);
+                        printf("----------------\n");
+
+
                         // Found the file, get the inode
-                        ret = (struct wfs_inode *)((char*)disk_mmap[0] + superblock->i_blocks_ptr + dentry[j].num * BLOCK_SIZE);
+                        int inode_num = dentry[j].num;
+                        off_t inode_offset = superblock->i_bitmap_ptr + (off_t)(inode_num * BLOCK_SIZE);
+
+                        ret = (struct wfs_inode *)((char *)disk_mmap[0] + inode_offset);
 
                         // For debugging
-                        printf("Found file: %s\n", path_copy);
+                        printf("Found file: %s\n", token);
                         printf("Inode details:\n");
-                        printf("    Num: %d\n", current_inode->num);
-                        printf("    Mode: %d\n", current_inode->mode);
-                        printf("    UID: %d\n", current_inode->uid);
-                        printf("    GID: %d\n", current_inode->gid);
-                        printf("    Size: %ld\n", current_inode->size);
-                        printf("    Nlinks: %d\n", current_inode->nlinks);
-                        printf("    Atime: %ld\n", current_inode->atim);
-                        printf("    Mtime: %ld\n", current_inode->mtim);
-                        printf("    Ctime: %ld\n", current_inode->ctim);
+                        printf("    Num: %d\n", ret->num);
+                        printf("    Mode: %d\n", ret->mode);
+                        printf("    UID: %d\n", ret->uid);
+                        printf("    GID: %d\n", ret->gid);
+                        printf("    Size: %ld\n", ret->size);
+                        printf("    Nlinks: %d\n", ret->nlinks);
+                        printf("    Atime: %ld\n", ret->atim);
+                        printf("    Mtime: %ld\n", ret->mtim);
+                        printf("    Ctime: %ld\n", ret->ctim);
                         return ret;
                     }
                 }
@@ -268,6 +289,7 @@ static int wfs_getattr(const char* path, struct stat* stbuf)
     // Print out the inode stats for debugging purposes
     printf("Inode stats:\n");
     printf("----------------\n");
+    printf("    Num: %d\n", inode->num);    
     printf("    UID: %d\n", inode->uid);
     printf("    GID: %d\n", inode->gid);
     printf("    Atime: %ld\n", inode->atim);
@@ -378,7 +400,7 @@ static int wfs_mkdir(const char* path, mode_t mode)
     printf("Allocated new inode for directory\n");
 
     // Initialize the new inode
-    new_inode->num = new_inode - (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr);
+    new_inode->num = new_inode->num;
     new_inode->mode = S_IFDIR | mode;
     new_inode->uid = getuid();
     new_inode->gid = getgid();
@@ -387,6 +409,20 @@ static int wfs_mkdir(const char* path, mode_t mode)
     new_inode->atim = time(NULL);
     new_inode->mtim = new_inode->atim;
     new_inode->ctim = new_inode->atim;
+
+    // Print out the inode stats for debugging purposes
+    printf("Inode stats:\n");
+    printf("----------------\n");
+    printf("    Num: %d\n", new_inode->num);
+    printf("    Mode: %d\n", new_inode->mode);
+    printf("    UID: %d\n", new_inode->uid);
+    printf("    GID: %d\n", new_inode->gid);
+    printf("    Size: %ld\n", new_inode->size);
+    printf("    Nlinks: %d\n", new_inode->nlinks);
+    printf("    Atime: %ld\n", new_inode->atim);
+    printf("    Mtime: %ld\n", new_inode->mtim);
+    printf("    Ctime: %ld\n", new_inode->ctim);
+    printf("----------------\n");
 
     // Update the parent directory
     printf("Updating parent directory...\n");
