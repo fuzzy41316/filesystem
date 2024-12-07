@@ -241,9 +241,10 @@ struct wfs_inode *get_inode_from_path(const char* path)
     struct wfs_inode *current_inode = (struct wfs_inode *)((char *)disk_mmap[0] + superblock->i_blocks_ptr); 
     struct wfs_inode *ret = NULL;
     char *token = strtok(path_copy, "/"); // Get the first token
+    int i = 0;
     while(token != NULL)
     {
-        printf("Checking directory: %s\n", token);
+        printf("Checking directory entries for directory number %d from path %s\n", i++, path); // Debugging statements
         ret = NULL; // Reset for each token
 
         // Check each block of the current_inode
@@ -257,35 +258,14 @@ struct wfs_inode *get_inode_from_path(const char* path)
 
                 for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
                 {
-                    printf("Directory entry name: %s\n", dentry[j].name);
+                    printf("Diretory entry name: %s\n", dentry[j].name);
                     if (strcmp(dentry[j].name, token) == 0)
                     {
-                        printf("Found file in directory entry: %s\n", token);
-                        printf("Directory entry details:\n");
-                        printf("----------------\n");
-                        printf("    Name: %s\n", dentry[j].name);
-                        printf("    Num: %d\n", dentry[j].num);
-                        printf("----------------\n");
-
-
                         // Found the file, get the inode
                         int inode_num = dentry[j].num;
                         off_t inode_offset = superblock->i_bitmap_ptr + (off_t)(inode_num * BLOCK_SIZE);
 
                         ret = (struct wfs_inode *)((char *)disk_mmap[0] + inode_offset);
-
-                        // For debugging
-                        printf("Found file: %s\n", token);
-                        printf("Inode details:\n");
-                        printf("    Num: %d\n", ret->num);
-                        printf("    Mode: %d\n", ret->mode);
-                        printf("    UID: %d\n", ret->uid);
-                        printf("    GID: %d\n", ret->gid);
-                        printf("    Size: %ld\n", ret->size);
-                        printf("    Nlinks: %d\n", ret->nlinks);
-                        printf("    Atime: %ld\n", ret->atim);
-                        printf("    Mtime: %ld\n", ret->mtim);
-                        printf("    Ctime: %ld\n", ret->ctim);
                         break;
                     }
                 }
