@@ -170,10 +170,12 @@ void raid_mirroring()
         if (raid_mode == RAID_1)
         {
             // Data bitmaps are identical on all drives
-            memcpy(disk_mmap[i] + superblock->d_bitmap_ptr, disk_mmap[0] + superblock->d_bitmap_ptr, superblock->num_data_blocks);
+            memcpy(disk_mmap[i] + superblock->d_bitmap_ptr, 
+                disk_mmap[0] + superblock->d_bitmap_ptr, superblock->num_data_blocks);
             
             // Data blocks are identical on all drives
-            memcpy(disk_mmap[i] + superblock->d_blocks_ptr, disk_mmap[0]+ superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+            memcpy(disk_mmap[i] + superblock->d_blocks_ptr, 
+                disk_mmap[0]+ superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
         }
 
         // Raid 1v stuff later, idk
@@ -633,6 +635,10 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
         int block_index = current_offset / BLOCK_SIZE;
         int block_offset = current_offset % BLOCK_SIZE;
 
+        // Calculate the disk index and disk offset for RAID 0
+        int disk_index = (current_offset / BLOCK_SIZE) % disk_count;
+        off_t disk_offset = (current_offset / disk_count) * BLOCK_SIZE + (current_offset % BLOCK_SIZE);
+
         // Check if the block is allocated
         if (block_index >= N_BLOCKS || file_inode_ptr->blocks[block_index] == 0)
             return -EIO; // Block is not allocated  
@@ -643,8 +649,12 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
             read_size = bytes_remaining;
 
         // Read the data from the block
+        char *raid_0_block_ptr = disk_mmap[disk_index] + file_inode_ptr->blocks[block_index] + disk_offset;
         char *block_ptr = disk_mmap[0] + file_inode_ptr->blocks[block_index] + block_offset;
-        memcpy(buf + bytes_read, block_ptr, read_size);
+        if (raid_mode == RAID_0)
+            memcpy(buf + bytes_read, raid_0_block_ptr, read_size);
+        else    
+            memcpy(buf + bytes_read, block_ptr, read_size);
 
         // Update the counters
         bytes_read += read_size;
@@ -696,6 +706,11 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
         int block_index = current_offset / BLOCK_SIZE;
         int block_offset = current_offset % BLOCK_SIZE;
 
+        // Calculated for data striping for RAID_0
+        int disk_index = (current_offset / BLOCK_SIZE) % disk_count;
+        off_t disk_offset = (current_offset / BLOCK_SIZE) * BLOCK_SIZE + (current_offset % BLOCK_SIZE);
+        
+
         // Check if we need to allocate a new data block
         if (block_index >= N_BLOCKS || file_inode_ptr->blocks[block_index] == 0)
         {
@@ -712,8 +727,12 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
             write_size = byte_remaining;    
         
         // Write the data to the block
+        char *raid_0_block_ptr = disk_mmap[disk_index] + file_inode_ptr->blocks[block_index] + disk_offset;
         char *block_ptr = disk_mmap[0] + file_inode_ptr->blocks[block_index] + block_offset;
-        memcpy(block_ptr, buf + bytes_written, write_size);
+        if (raid_mode == RAID_0)
+            memcpy(raid_0_block_ptr, buf + bytes_written, write_size);
+        else
+            memcpy(block_ptr, buf + bytes_written, write_size);
 
         // Update the counters
         bytes_written += write_size;
