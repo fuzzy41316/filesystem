@@ -598,19 +598,70 @@ static int wfs_rmdir(const char* path)
 }
 
 /* 
- * Read sizebytes from the given file into the buffer buf, beginning offset bytes into the file. 
- * See read(2) for full details. Returns the number of bytes transferred, or 0 if offset was at or beyond the end of the file. 
- * Required for any sensible filesystem.
+ * To read from a file, find the data block corresponding to the offset being read from, and copy data from the data block(s) to the read buffer. 
+ * As with writes, reads may be split across data blocks, or span multiple data blocks.
  */
 static int wfs_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
     printf("wfs_read called with path: %s\n", path);      // Debugging statement
+    
+   // Make sure file exists
+   struct wfs_inode *file_inode_ptr = get_inode_from_path(path);
+   if (file_inode_ptr == NULL)
+       return -ENOENT; // File doesn't exist
+    
+    // Ensure the file is regular
+    if ((file_inode_ptr->mode & S_IFREG) != S_IFREG)
+        return -EISDIR; // File is not regular
+    
+    // Read inode for list of current data blocks and how large file is
+    size_t bytes_read = 0;
+    size_t bytes_remaining = size;
+    off_t current_offset = offset;
 
-    return 1;
+    // Cannot read beyond the end of the file
+    if (current_offset >= file_inode_ptr->size)
+        return 0;
+    
+    // Adjust the size if necessary, based on the current file size
+    if (current_offset + size > file_inode_ptr->size)
+        bytes_remaining = file_inode_ptr->size - current_offset; 
+
+    while (bytes_remaining > 0)
+    {
+        // Calculate the block index and offset within the block
+        int block_index = current_offset / BLOCK_SIZE;
+        int block_offset = current_offset % BLOCK_SIZE;
+
+        // Check if the block is allocated
+        if (block_index >= N_BLOCKS || file_inode_ptr->blocks[block_index] == 0)
+            return -EIO; // Block is not allocated  
+
+        // Calculate the amount of data to read in the current block
+        size_t read_size = BLOCK_SIZE - block_offset;
+        if (read_size > bytes_remaining)
+            read_size = bytes_remaining;
+
+        // Read the data from the block
+        char *block_ptr = disk_mmap[0] + file_inode_ptr->blocks[block_index] + block_offset;
+        memcpy(buf + bytes_read, block_ptr, read_size);
+
+        // Update the counters
+        bytes_read += read_size;
+        bytes_remaining -= read_size;
+        current_offset += read_size;
+    }
+    // Update the access time of the file
+    file_inode_ptr->atim = time(NULL);
+    
+    raid_mirroring();
+    return bytes_read;
 }
 
 /* 
- * As for read above, except that it can't return 0.
+ * To write to a file, find the data block corresponding to the offset being written to, and copy data from the write buffer into the data block(s). 
+ * Note that writes may be split across data blocks, or span multiple data blocks. New data blocks should be allocated using the data block bitmap.
+ * Cannot return 0; must return the number of bytes written, or an error code.
  */
 static int wfs_write(const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
@@ -625,7 +676,56 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
      * 5. Update timestamp and address of new data block inside the bar inode
     */
 
-    return 1;
+   // Make sure file exists
+   struct wfs_inode *file_inode_ptr = get_inode_from_path(path);
+   if (file_inode_ptr == NULL)
+       return -ENOENT; // File doesn't exist
+    
+    // Ensure the file is regular
+    if ((file_inode_ptr->mode & S_IFREG) != S_IFREG)
+        return -EISDIR; // File is not regular
+    
+    // Read inode for list of current data blocks and how large file is
+    size_t bytes_written = 0;
+    size_t byte_remaining = size;
+    off_t current_offset = offset;
+
+    // If there's space in the current data block, then use it, otherwise allocate a new data block
+    while (byte_remaining > 0)
+    {
+        int block_index = current_offset / BLOCK_SIZE;
+        int block_offset = current_offset % BLOCK_SIZE;
+
+        // Check if we need to allocate a new data block
+        if (block_index >= N_BLOCKS || file_inode_ptr->blocks[block_index] == 0)
+        {
+            off_t new_block = allocate_data_block();
+            if (new_block < 0)
+                return -ENOSPC; // No more space in data blocks
+
+            file_inode_ptr->blocks[block_index] = new_block;
+        }
+
+        // Calculate the amount of data to write in the current block
+        size_t write_size = BLOCK_SIZE - block_index;
+        if (write_size > byte_remaining)
+            write_size = byte_remaining;    
+        
+        // Write the data to the block
+        char *block_ptr = disk_mmap[0] + file_inode_ptr->blocks[block_index] + block_offset;
+        memcpy(block_ptr, buf + bytes_written, write_size);
+
+        // Update the counters
+        bytes_written += write_size;
+        byte_remaining -= write_size;
+        current_offset += write_size;
+    }
+    // Update timestamp of the new data block inside the inode
+    file_inode_ptr->mtim = time(NULL);
+    file_inode_ptr->size = offset + size;   // New size of file
+
+    raid_mirroring();
+    return bytes_written;    
 }
 
 /* 
