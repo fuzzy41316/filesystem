@@ -65,8 +65,86 @@ char** split_path(const char* path, int* count);
 struct wfs_inode *get_inode_from_path(const char* path);
 static int update_parent_directory(struct wfs_inode *parent_inode, const char* file_name, struct wfs_inode *child_inode);
 static int allocate_data_block();
-void raid_mirroring();
 static int create_new_file(const char* path, mode_t mode);
+void disk_stats();
+void mirror_raid();
+
+void mirror_raid()
+{
+
+    printf("Before mirroring metadata...\n");
+    disk_stats();
+    // Allocate this inode for all disks
+    for (int i = 1; i < disk_count; i++)
+    {
+        // Mirror the inode_bitmap
+        memcpy(disk_mmap[i] + superblock->i_bitmap_ptr, 
+            disk_mmap[0] + superblock->i_bitmap_ptr, superblock->num_inodes / 8);
+
+        // Mirror the actual inode blocks
+        memcpy(disk_mmap[i] + superblock->i_blocks_ptr, 
+            disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
+
+        if (raid_mode == RAID_1)
+        {
+            // Mirror the data_bitmap
+            memcpy(disk_mmap[i] + superblock->d_bitmap_ptr, 
+                disk_mmap[0] + superblock->d_bitmap_ptr, superblock->num_data_blocks / 8);
+
+            // Mirror the data blocks
+            memcpy(disk_mmap[i] + superblock->d_blocks_ptr, 
+                disk_mmap[0] + superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+        }
+    }
+    printf("After mirroring metadata...\n");
+    disk_stats();
+}
+
+// Debugging function
+void disk_stats()
+{
+    printf("Disk Stats: \n");
+    printf("----------------\n");
+    for (int i = 0; i < disk_count; i++)
+    {
+        printf("Disk %d: %s\n", i + 1, disk_files[i]);
+        printf("Disk Location: %p\n", disk_mmap[i]);
+
+        // Print inode bitmap stats
+        printf("Inode Bitmap Stats:\n");
+        for (size_t j = 0; j < superblock->num_inodes; j++) 
+        {
+            printf("-->%02x<-- ", (unsigned char)disk_mmap[i][superblock->i_bitmap_ptr + j]);
+            if ((j + 1) % 16 == 0) printf("\n");
+        }
+        printf("\n");
+        // Print inode block stats
+        for (size_t j = 0; j < superblock->num_inodes; j++)
+        {
+            struct wfs_inode *inode = (struct wfs_inode *)(disk_mmap[i] + superblock->i_blocks_ptr + j * BLOCK_SIZE);
+            printf("Inode %ld:\n", j);
+            printf("    Num: %d\n", inode->num);
+            printf("    Mode: %d\n", inode->mode);
+            printf("    UID: %d\n", inode->uid);
+            printf("    GID: %d\n", inode->gid);
+            printf("    Size: %ld\n", inode->size);
+            printf("    Nlinks: %d\n", inode->nlinks);
+            printf("    Atime: %ld\n", inode->atim);
+            printf("    Mtime: %ld\n", inode->mtim);
+            printf("    Ctime: %ld\n", inode->ctim);
+        }
+
+        // Print data block bitmap stats
+        printf("Data Block Bitmap Stats:\n");
+        for (size_t k = 0; k < superblock->num_data_blocks; k++) 
+        {
+            printf("-->%02x<-- ", (unsigned char)disk_mmap[i][superblock->d_bitmap_ptr + k]);
+            if ((k + 1) % 16 == 0) printf("\n");
+        }
+        printf("\n");
+    }
+    printf("----------------\n");
+}
 
 // Used by wfs_mkdir and wfs_mknod, due to their redundancies
 static int create_new_file(const char* path, mode_t mode)
@@ -113,8 +191,10 @@ static int create_new_file(const char* path, mode_t mode)
     printf("Parent exists and is writable\n");
 
     printf("Allocating new inode for directory...\n");
+
     // Allocate a new inode for the directory (using the inode bitmap)
     struct wfs_inode *new_inode = allocate_inode(disk_mmap[0] + superblock->i_bitmap_ptr);
+
     if (new_inode == NULL)
         return -ENOSPC; // No more inodes available
     printf("Allocated new inode for directory\n");
@@ -149,46 +229,27 @@ static int create_new_file(const char* path, mode_t mode)
     if (update_parent_directory(parent_inode, child_name, new_inode) < 0)
         return -ENOSPC; // No more space in parent directory
     printf("Parent directory updated\n");
-
     return 0;
 }
 
-// Different RAID mode initializations
-void raid_mirroring()
+// Allocates an inode using a bitmap, and returns the pointer to a new inode, or returns an error if there are no more nodes available
+struct wfs_inode *allocate_inode(char *i_bitmap_ptr)
 {
-    for (int i = 1; i < disk_count; i++)
+    // Check if there's any available inodes
+    for (size_t i = 0; i < superblock->num_inodes; i++)
     {
-        // Inode bitmaps are identical on all drives
-        memcpy(disk_mmap[i] + superblock->i_bitmap_ptr,
-            disk_mmap[0] + superblock->i_bitmap_ptr, superblock->num_inodes);
-
-        // Inode blocks are identical on all drives
-        memcpy(disk_mmap[i] + superblock->i_blocks_ptr,
-            disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
-        
-
-        if (raid_mode == RAID_1)
+        // Find an empty inode
+        if (!is_inode_set(i_bitmap_ptr, (off_t)i))
         {
-            // Data bitmaps are identical on all drives
-            memcpy(disk_mmap[i] + superblock->d_bitmap_ptr, 
-                disk_mmap[0] + superblock->d_bitmap_ptr, superblock->num_data_blocks);
-            
-            // Data blocks are identical on all drives
-            memcpy(disk_mmap[i] + superblock->d_blocks_ptr, 
-                disk_mmap[0]+ superblock->d_blocks_ptr, superblock->num_data_blocks * BLOCK_SIZE);
+            // Set the inode in the bitmap
+            off_t inode_offset = superblock->i_blocks_ptr + (off_t)(i * BLOCK_SIZE);
+            struct wfs_inode *inode = (struct wfs_inode *)(disk_mmap[0] + inode_offset);   
+            inode->num = (int)i;
+            set_inode_bitmap(i_bitmap_ptr, (off_t)i);
+            return inode;
         }
-
-        // Raid 1v stuff later, idk
     }
-    
-}
-
-// Given a pointer to a bitmap, clear the bit at the given offset
-void clear_inode_bitmap_bit(char *inode_bitmap_ptr, off_t inode_num)
-{
-    off_t byte_num = inode_num / 8;
-    off_t bit_num = inode_num % 8;
-    inode_bitmap_ptr[byte_num] &= ~(1 << bit_num);
+    return NULL; // No available inodes
 }
 
 // Allocate a data block, and return the block number, or return an error if there are no more data blocks available
@@ -207,6 +268,15 @@ static int allocate_data_block()
         }
     }
     return -ENOSPC; // No available data blocks
+}
+
+
+// Given a pointer to a bitmap, clear the bit at the given offset
+void clear_inode_bitmap_bit(char *inode_bitmap_ptr, off_t inode_num)
+{
+    off_t byte_num = inode_num / 8;
+    off_t bit_num = inode_num % 8;
+    inode_bitmap_ptr[byte_num] &= ~(1 << bit_num);
 }
 
 // Given a parent and newly-created child inode, update the parent directory to include the new child, directory or regular file
@@ -272,26 +342,6 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
         }
     }
     return -ENOSPC; // No more space in parent directory
-}
-
-// Allocates an inode using a bitmap, and returns the pointer to a new inode, or returns an error if there are no more nodes available
-struct wfs_inode *allocate_inode(char *i_bitmap_ptr)
-{
-    // Check if there's any available inodes
-    for (size_t i = 0; i < superblock->num_inodes; i++)
-    {
-        // Find an empty inode
-        if (!is_inode_set(i_bitmap_ptr, (off_t)i))
-        {
-            // Set the inode in the bitmap
-            off_t inode_offset = superblock->i_blocks_ptr + (off_t)(i * BLOCK_SIZE);
-            struct wfs_inode *inode = (struct wfs_inode *)(disk_mmap[0] + inode_offset);   
-            inode->num = (int)i;
-            set_inode_bitmap(i_bitmap_ptr, (off_t)i);
-            return inode;
-        }
-    }
-    return NULL; // No available inodes
 }
 
 // Given the ptr to the inode_bitmap, set the bit in the inode_bitmap corresponding to the inode_num
@@ -437,7 +487,8 @@ static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
     if (create_new_file(path, S_IFREG | mode) < 0)
         return -ENOSPC; // No more space in parent directory
 
-    raid_mirroring();
+    mirror_raid();
+
     return 0;
 }
 
@@ -457,7 +508,7 @@ static int wfs_mkdir(const char* path, mode_t mode)
     if (create_new_file(path, S_IFDIR | mode) < 0)
         return -ENOSPC; // No more space in parent directory
 
-    raid_mirroring();
+    mirror_raid();
     return 0;
 }
 
@@ -522,7 +573,7 @@ static int wfs_unlink(const char* path)
         printf("Cleared indirect block: %ld\n", file_inode_ptr->blocks[IND_BLOCK]);
     }
 
-    raid_mirroring();
+    mirror_raid();
     return 0;
 }
 
@@ -590,7 +641,8 @@ static int wfs_rmdir(const char* path)
                 char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
                 off_t offset = directory_inode_ptr->num;
                 clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
-                raid_mirroring();
+
+                mirror_raid();
                 return 0;
             }
         }
@@ -664,7 +716,6 @@ static int wfs_read(const char* path, char* buf, size_t size, off_t offset, stru
     // Update the access time of the file
     file_inode_ptr->atim = time(NULL);
     
-    raid_mirroring();
     return bytes_read;
 }
 
@@ -743,7 +794,7 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
     file_inode_ptr->mtim = time(NULL);
     file_inode_ptr->size = offset + size;   // New size of file
 
-    raid_mirroring();
+    mirror_raid();
     return bytes_written;    
 }
 
