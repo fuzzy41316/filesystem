@@ -74,7 +74,7 @@ void mirror_raid()
 {
 
     printf("Before mirroring metadata...\n");
-    //disk_stats();
+    disk_stats();
     // Allocate this inode for all disks
     for (int i = 1; i < disk_count; i++)
     {
@@ -82,7 +82,7 @@ void mirror_raid()
         memcpy(disk_mmap[i] + superblock->i_bitmap_ptr, 
             disk_mmap[0] + superblock->i_bitmap_ptr, superblock->num_inodes / 8);
 
-        // Mirror the actual inode blocks
+        // Mirror the actual inode blockss
         memcpy(disk_mmap[i] + superblock->i_blocks_ptr, 
             disk_mmap[0] + superblock->i_blocks_ptr, superblock->num_inodes * BLOCK_SIZE);
 
@@ -98,7 +98,7 @@ void mirror_raid()
         }
     }
     printf("After mirroring metadata...\n");
-    //disk_stats();
+    disk_stats();
 }
 
 // Debugging function
@@ -120,6 +120,7 @@ void disk_stats()
         }
         printf("\n");
         // Print inode block stats
+        /*
         for (size_t j = 0; j < superblock->num_inodes; j++)
         {
             struct wfs_inode *inode = (struct wfs_inode *)(disk_mmap[i] + superblock->i_blocks_ptr + j * BLOCK_SIZE);
@@ -134,6 +135,7 @@ void disk_stats()
             printf("    Mtime: %ld\n", inode->mtim);
             printf("    Ctime: %ld\n", inode->ctim);
         }
+        */
 
         // Print data block bitmap stats
         printf("Data Block Bitmap Stats:\n");
@@ -151,19 +153,19 @@ static int remove_file(const char *path)
 {
     struct wfs_inode *file = get_inode_from_path(path);
     if (file == NULL)
-        return -ENOENT; // Directory doesn't exist
+        return -ENOENT; // File doesn't exist
     
     if ((file->mode & S_IWUSR) != S_IWUSR)
-        return -EACCES; // Directory is not writable
+        return -EACCES; // File is not writable
     
     if ((file->mode & S_IFDIR) == S_IFDIR && file->nlinks > 2)
         return -ENOTEMPTY; // Directory is not empty
 
-    // Remove the current directory from the parent directory
-    printf("Acquiring parent directory to remove current directory from...\n");
+    // Remove the current file from the parent directory
+    printf("Acquiring parent directory to remove current file from...\n");
     char parent_path[strlen(path) + 1]; 
     strcpy(parent_path, path);
-    char *last_slash = strrchr(parent_path, '/');     // Find the final occurence of '/' in the path
+    char *last_slash = strrchr(parent_path, '/');     // Find the final occurrence of '/' in the path
     if (last_slash == NULL)
         return -EINVAL; // Invalid path
     if (last_slash == parent_path)
@@ -173,7 +175,7 @@ static int remove_file(const char *path)
     printf("Acquired parent directory: %s\n", parent_path);
     printf("Child path: %s\n", path);
 
-    // Find the parent directory inode from the parent path, and ensure it's writable and and a valid directory
+    // Find the parent directory inode from the parent path, and ensure it's writable and a valid directory
     struct wfs_inode *parent_directory_inode_ptr = get_inode_from_path(parent_path);
     if (parent_directory_inode_ptr == NULL)
         return -ENOENT; // Parent directory doesn't exist
@@ -182,7 +184,7 @@ static int remove_file(const char *path)
     if ((parent_directory_inode_ptr->mode & S_IWUSR) != S_IWUSR)
         return -EACCES; // Parent is not writable
 
-    // Remove the directory from the parent directory
+    // Remove the directory entry from the parent directory
     int found = 0;
     for (size_t i = 0; i < D_BLOCK; i++)    // Directory entries are stored in the direct blocks
     {
@@ -190,53 +192,77 @@ static int remove_file(const char *path)
 
         for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
         {
-            // Compare the inode number in the parent directory, and if it matches the directory inode number, remove it
+            // Compare the inode number in the parent directory, and if it matches the file inode number, remove it
             if (wfs_dentry_ptr[j].num == file->num)
             {
+                printf("Removing directory entry of file from parent directory...\n");
                 wfs_dentry_ptr[j].num = 0;
                 memset(wfs_dentry_ptr[j].name, 0, MAX_NAME);
                 parent_directory_inode_ptr->mtim = time(NULL);
-
-                // Clear the bitmap bit for the directory inode
-                char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
-                off_t offset = file->num;
-                clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
+                printf("Removed directory entry of file from parent directory\n");
 
                 found = 1;
                 break;
             }
         }
+        if (found)
+            break;
     }
-    // Check if there's any indirect blocks 
+
+    parent_directory_inode_ptr->nlinks--; // Decrement the number of links in the parent directory
+
+    // Deallocate direct blocks
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        if (file->blocks[i] != 0)
+        {
+            printf("Deallocating data block %ld...\n", file->blocks[i]);
+            char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;
+            off_t block_num = (file->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE;
+            clear_inode_bitmap_bit(data_bitmap_ptr, block_num);
+            memset(disk_mmap[0] + file->blocks[i], 0, BLOCK_SIZE); // Clear data block
+            file->blocks[i] = 0;
+            printf("Deallocated data block\n");
+        }
+    }
+
+    // Deallocate indirect blocks
     if (file->blocks[IND_BLOCK] != 0)
     {
+        printf("Deallocating indirect block...\n");
         off_t *indirect_block = (off_t *)(disk_mmap[0] + file->blocks[IND_BLOCK]);
-        for (size_t i = 0; i < BLOCK_SIZE / sizeof(off_t); i++) // Indirect block can store BLOCK_SIZE/sizeof(off_t) data block pointers
+        for (size_t i = 0; i < BLOCK_SIZE; i++) // Indirect block can store BLOCK_SIZE/sizeof(off_t) data block pointers
         {
             if (indirect_block[i] != 0)
             {
-                // Iterate through the data block and clear the directory entry
-                struct wfs_dentry *wfs_dentry_ptr = (struct wfs_dentry *)(disk_mmap[0] + indirect_block[i]);    
-                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
-                {
-                    if (wfs_dentry_ptr[j].num == file->num)
-                    {
-                        wfs_dentry_ptr[j].num = 0;
-                        memset(wfs_dentry_ptr[j].name, 0, MAX_NAME);
-                        parent_directory_inode_ptr->mtim = time(NULL);
-
-                        // Clear the bitmap bit for the directory inode
-                        char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
-                        off_t offset = file->num;
-                        clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
-
-                        found = 1;
-                        break;
-                    }
-                }
+                printf("Deallocating data block in indirect block %ld...\n", indirect_block[i]);
+                char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;
+                off_t block_num = (indirect_block[i] - superblock->d_blocks_ptr) / BLOCK_SIZE;
+                clear_inode_bitmap_bit(data_bitmap_ptr, block_num);
+                memset(disk_mmap[0] + indirect_block[i], 0, BLOCK_SIZE); // Clear data block
+                indirect_block[i] = 0;
+                printf("Deallocated data block in indirect block\n");
             }
         }
+        // Deallocate the indirect block itself
+        char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;
+        off_t block_num = (file->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE;
+        clear_inode_bitmap_bit(data_bitmap_ptr, block_num);
+
+        printf("Deallocating indirect block %ld...\n", file->blocks[IND_BLOCK]);  
+        memset(indirect_block, 0, BLOCK_SIZE); // Clear indirect block
+        file->blocks[IND_BLOCK] = 0;
+        printf("Deallocated indirect block\n");
     }
+
+    // Clear the inode bitmap
+    char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
+    off_t inode_num = file->num;
+    clear_inode_bitmap_bit(inode_bitmap_ptr, inode_num);
+
+    // Clear the inode itself
+    memset(disk_mmap[0] + superblock->i_blocks_ptr + inode_num * BLOCK_SIZE, 0, BLOCK_SIZE);
+  
 
     mirror_raid();  // Mirror the RAID after removing the file
 
@@ -244,7 +270,6 @@ static int remove_file(const char *path)
     // Entry otherwise was not found
     else return -ENOENT;
 }
-
 
 // Used by wfs_mkdir and wfs_mknod, due to their redundancies
 static int create_new_file(const char* path, mode_t mode)
@@ -412,6 +437,8 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
                     
                     // Update parent inode modification time
                     parent_inode->mtim = time(NULL);
+
+                    parent_inode->nlinks++; // Increment the number of links in the parent directory
                     return 1;
                 }
             }
@@ -794,18 +821,17 @@ static int wfs_write(const char* path, const char* buf, size_t size, off_t offse
                 file_inode_ptr->blocks[IND_BLOCK] = block_ptr;
                 printf("Allocated new data block for indirect block: %ld\n", block_ptr);
                 // Clear the indirect block when allocated for the first time
-                memset((void *)(file_inode_ptr->blocks[IND_BLOCK] + (off_t)(disk_mmap[disk_index])), 0, BLOCK_SIZE);
+                memset((void *)(file_inode_ptr->blocks[IND_BLOCK] + disk_mmap[disk_index]), 0, BLOCK_SIZE);
+                            // Indirect block was allocated, so get the pointer to the indirect block
+                printf("Allocated indirect block: %ld\n", file_inode_ptr->blocks[IND_BLOCK]); 
             }
-            // Indirect block was allocated, so get the pointer to the indirect block
-            printf("Allocated indirect block: %ld\n", file_inode_ptr->blocks[IND_BLOCK]); 
-
             // Check if indirect block has maxxed out entries
             if (block_index - IND_BLOCK >= BLOCK_SIZE / sizeof(off_t))
                 return -ENOSPC; // No more space in indirect block
             printf("Indirect block has space for entries\n");
 
             // Get the pointer to the indirect block
-            off_t *indirect_block_ptr = (off_t *)(file_inode_ptr->blocks[IND_BLOCK] + (off_t)(disk_mmap[disk_index]));
+            off_t *indirect_block_ptr = (off_t *)(file_inode_ptr->blocks[IND_BLOCK] + disk_mmap[disk_index]);
 
             // Allocate a data block for the indirect block
             if (indirect_block_ptr[block_index - IND_BLOCK] == 0)
