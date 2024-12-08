@@ -66,6 +66,7 @@ struct wfs_inode *get_inode_from_path(const char* path);
 static int update_parent_directory(struct wfs_inode *parent_inode, const char* file_name, struct wfs_inode *child_inode);
 static int allocate_data_block();
 static int create_new_file(const char* path, mode_t mode);
+static int remove_file(const char *path);
 void disk_stats();
 void mirror_raid();
 
@@ -145,6 +146,70 @@ void disk_stats()
     }
     printf("----------------\n");
 }
+
+static int remove_file(const char *path)
+{
+    struct wfs_inode *file = get_inode_from_path(path);
+    if (file == NULL)
+        return -ENOENT; // Directory doesn't exist
+    
+    if ((file->mode & S_IWUSR) != S_IWUSR)
+        return -EACCES; // Directory is not writable
+    
+    if ((file->mode & S_IFDIR) == S_IFDIR && file->nlinks > 2)
+        return -ENOTEMPTY; // Directory is not empty
+
+    // Remove the current directory from the parent directory
+    printf("Acquiring parent directory to remove current directory from...\n");
+    char parent_path[strlen(path) + 1]; 
+    strcpy(parent_path, path);
+    char *last_slash = strrchr(parent_path, '/');     // Find the final occurence of '/' in the path
+    if (last_slash == NULL)
+        return -EINVAL; // Invalid path
+    if (last_slash == parent_path)
+        strcpy(parent_path, "/"); // Root directory
+    else
+        *last_slash = '\0'; // Terminate the parent path
+    printf("Acquired parent directory: %s\n", parent_path);
+    printf("Child path: %s\n", path);
+
+    // Find the parent directory inode from the parent path, and ensure it's writable and and a valid directory
+    struct wfs_inode *parent_directory_inode_ptr = get_inode_from_path(parent_path);
+    if (parent_directory_inode_ptr == NULL)
+        return -ENOENT; // Parent directory doesn't exist
+    if ((parent_directory_inode_ptr->mode & S_IFDIR) != S_IFDIR)
+        return -ENOTDIR; // Parent is not a directory
+    if ((parent_directory_inode_ptr->mode & S_IWUSR) != S_IWUSR)
+        return -EACCES; // Parent is not writable
+
+    // Remove the directory from the parent directory
+    for (size_t i = 0; i < D_BLOCK; i++)
+    {
+        struct wfs_dentry *wfs_dentry_ptr = (struct wfs_dentry *)(disk_mmap[0] + parent_directory_inode_ptr->blocks[i]);
+
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+        {
+            // Compare the inode number in the parent directory, and if it matches the directory inode number, remove it
+            if (wfs_dentry_ptr[j].num == file->num)
+            {
+                wfs_dentry_ptr[j].num = 0;
+                memset(wfs_dentry_ptr[j].name, 0, MAX_NAME);
+                parent_directory_inode_ptr->mtim = time(NULL);
+
+                // Clear the bitmap bit for the directory inode
+                char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
+                off_t offset = file->num;
+                clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
+
+                mirror_raid();
+                return 0;
+            }
+        }
+    }
+    // Entry otherwise was not found
+    return -ENOENT;
+}
+
 
 // Used by wfs_mkdir and wfs_mknod, due to their redundancies
 static int create_new_file(const char* path, mode_t mode)
@@ -520,60 +585,9 @@ static int wfs_unlink(const char* path)
 {
     printf("wfs_unlink called with path: %s\n", path);      // Debugging statement
 
-    struct wfs_inode *file_inode_ptr = get_inode_from_path(path);
-    if (file_inode_ptr == NULL)
+    if (remove_file(path) < 0)
         return -ENOENT; // File doesn't exist
-    
-    // Release all of the data blocks associated with the inode
-    printf("Releasing data blocks associated with the inode...\n");
-    for (size_t i = 0; i < D_BLOCK; i++)
-    {
-        if (file_inode_ptr->blocks[i] != 0)
-        {
-            printf("Found non-empty data-block: %ld\n", file_inode_ptr->blocks[i]);
-            // Clear the data associated with the data block
-            memset(disk_mmap[0] + file_inode_ptr->blocks[i], 0, BLOCK_SIZE);
-            char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;   
-            off_t offset = (file_inode_ptr->blocks[i] - superblock->d_blocks_ptr) / BLOCK_SIZE;
 
-            clear_inode_bitmap_bit(data_bitmap_ptr, offset);
-            file_inode_ptr->blocks[i] = 0;
-            printf("Cleared data block: %ld\n", file_inode_ptr->blocks[i]);
-        }
-    }
-    printf("Released data blocks associated with the inode\n");
-
-    printf("Releasing indirect block associated with the inode...\n");
-    // Release the blocks associated with the singular indirect block, if nonempty
-    if (file_inode_ptr->blocks[IND_BLOCK] != 0)
-    {
-        // Find the data blocks under the indirect block
-        off_t *indirect_block = (off_t *)(disk_mmap[0] + file_inode_ptr->blocks[IND_BLOCK]);
-
-        printf("Found indirect block: %ld\n", file_inode_ptr->blocks[IND_BLOCK]);
-        // Release any data blocks associated with the indirect block
-        for (size_t i = 0; i < BLOCK_SIZE / sizeof(off_t); i++)
-        {
-            // There's a data block here
-            if (indirect_block[i] != 0)
-            {
-                // Clear the data associated with the data block
-                memset(disk_mmap[0] + indirect_block[i], 0, BLOCK_SIZE);
-                off_t offset = (indirect_block[i] - superblock->d_blocks_ptr) / BLOCK_SIZE;
-                char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;
-                clear_inode_bitmap_bit(data_bitmap_ptr, offset); 
-            }
-        }
-        printf("Released data blocks associated with the indirect block\n");
-        // After clearing all of the data blocks associated with the indirect block, clear the indirect block itself
-        memset(indirect_block, 0, BLOCK_SIZE);
-        char *data_bitmap_ptr = disk_mmap[0] + superblock->d_bitmap_ptr;
-        off_t offset = (file_inode_ptr->blocks[IND_BLOCK] - superblock->d_blocks_ptr) / BLOCK_SIZE;
-        clear_inode_bitmap_bit(data_bitmap_ptr, offset);
-        printf("Cleared indirect block: %ld\n", file_inode_ptr->blocks[IND_BLOCK]);
-    }
-
-    mirror_raid();
     return 0;
 }
 
@@ -586,69 +600,12 @@ static int wfs_rmdir(const char* path)
 
     // Make sure that the path is not the current directory
     if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0)
-        return -EINVAL; // Avoid deleting current or parent directory while in the current directory
+        return -EINVAL; 
 
-    struct wfs_inode *directory_inode_ptr = get_inode_from_path(path);
-    if (directory_inode_ptr == NULL)
+    if (remove_file(path) < 0)
         return -ENOENT; // Directory doesn't exist
-    
-    // Make sure the directory is writable
-    if ((directory_inode_ptr->mode & S_IWUSR) != S_IWUSR)
-        return -EACCES; // Directory is not writable
-    
-    // Make sure the directory is empty
-    if (directory_inode_ptr->nlinks > 2)
-        return -ENOTEMPTY; // Directory is not empty
-
-    // Remove the current directory from the parent directory
-    printf("Acquiring parent directory to remove current directory from...\n");
-    char parent_path[strlen(path) + 1]; 
-    strcpy(parent_path, path);
-    char *last_slash = strrchr(parent_path, '/');     // Find the final occurence of '/' in the path
-    if (last_slash == NULL)
-        return -EINVAL; // Invalid path
-    if (last_slash == parent_path)
-        strcpy(parent_path, "/"); // Root directory
-    else
-        *last_slash = '\0'; // Terminate the parent path
-    printf("Acquired parent directory: %s\n", parent_path);
-    printf("Child path: %s\n", path);
-
-    // Find the parent directory inode from the parent path, and ensure it's writable and and a valid directory
-    struct wfs_inode *parent_directory_inode_ptr = get_inode_from_path(parent_path);
-    if (parent_directory_inode_ptr == NULL)
-        return -ENOENT; // Parent directory doesn't exist
-    if ((parent_directory_inode_ptr->mode & S_IFDIR) != S_IFDIR)
-        return -ENOTDIR; // Parent is not a directory
-    if ((parent_directory_inode_ptr->mode & S_IWUSR) != S_IWUSR)
-        return -EACCES; // Parent is not writable
-
-    // Remove the directory from the parent directory
-    for (size_t i = 0; i < D_BLOCK; i++)
-    {
-        struct wfs_dentry *wfs_dentry_ptr = (struct wfs_dentry *)(disk_mmap[0] + parent_directory_inode_ptr->blocks[i]);
-
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
-        {
-            // Compare the inode number in the parent directory, and if it matches the directory inode number, remove it
-            if (wfs_dentry_ptr[j].num == directory_inode_ptr->num)
-            {
-                wfs_dentry_ptr[j].num = 0;
-                memset(wfs_dentry_ptr[j].name, 0, MAX_NAME);
-                parent_directory_inode_ptr->mtim = time(NULL);
-
-                // Clear the bitmap bit for the directory inode
-                char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
-                off_t offset = directory_inode_ptr->num;
-                clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
-
-                mirror_raid();
-                return 0;
-            }
-        }
-    }
-    // Entry otherwise was not found
-    return -ENOENT;
+        
+    return 0;
 }
 
 /* 
