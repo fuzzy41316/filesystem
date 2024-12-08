@@ -413,21 +413,18 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
     printf("----------------\n");
     printf("    Num: %d\n", parent_inode->num);
     printf("----------------\n");
-
-
-    // Check each block of the parent_inode
-    for (int i = 0; i < N_BLOCKS; i++)
-    {
-        printf("Checking block: %d\n", i); 
-        // If a block isn't empty, check it's directory entries
+    
+    // Check each block block of the parent inode to find an empty directory entry
+    for (int i = 0; i < D_BLOCK; i++)
+    {   
+    
         if (parent_inode->blocks[i] != 0)
         {
-            printf("Checking non-empty block: %d\n", i);
+            // Check the direct block for empty directory entries
             struct wfs_dentry *dentry = (struct wfs_dentry *)(disk_mmap[0] + parent_inode->blocks[i]);
 
             for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
             {
-                printf("Checking directory entry: %d\n", j);    
                 if (dentry[j].num == 0)
                 {
                     if (strlen(file_name) > MAX_NAME)
@@ -438,36 +435,65 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
                     // Update parent inode modification time
                     parent_inode->mtim = time(NULL);
 
-                    parent_inode->nlinks++; // Increment the number of links in the parent directory
                     return 1;
                 }
             }
         }
-        // Otherwise allocate a new data block for the inode
-        else
+        // If there's an empty direct block, allocate it and fill with dentries
+        else 
         {
-            printf("Allocating new data block for inode...\n");
             off_t inode_block = allocate_data_block(0);   // Inodes shared, use the first disk and mirror later
             if (inode_block < 0)
-                return -ENOSPC; // Return error generated from allocate_data_block()
-            printf("Allocated new data block for inode w/ block_number: %ld\n", inode_block);
+                return -ENOSPC; // No data blocks
 
-            printf("Updating parent inode with new data block...\n");
             parent_inode->blocks[i] = inode_block;
 
-            printf("parent_inode->blocks[%d] = %ld\n", i, parent_inode->blocks[i]);
             struct wfs_dentry *dentry = (struct wfs_dentry *)(disk_mmap[0] + parent_inode->blocks[i]);
+            
+            // Add entry to directory entries
             if (strlen(file_name) > MAX_NAME)
                 return -ENAMETOOLONG; // File name too long
-
-            printf("Updating directory: %s\n", file_name);
             dentry[0].num = child_inode->num;
             strcpy(dentry[0].name, file_name);
+            
+            // Update parent inode modification time
+            parent_inode->mtim = time(NULL);
 
-            printf("Parent inode new entry: name: %s number: %i\n", dentry[0].name, dentry[0].num);
             return 1;
         }
     }
+    
+    // If no space on direct blocks, check indirect block
+    off_t * indirect_block_ptr = (off_t *)(disk_mmap[0] + parent_inode->blocks[IND_BLOCK]);
+
+    // If there's an indirect block, index through the data blocks for space for the new directory entry
+    if (indirect_block_ptr != 0)
+    {
+        for (off_t i = 0; i < BLOCK_SIZE; i++)
+        {
+            if (indirect_block_ptr[i] != 0)
+            {
+                struct wfs_dentry *dentry = (struct wfs_dentry *)(disk_mmap[0] + indirect_block_ptr[i]);
+
+                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
+                {
+                    if (dentry[j].num == 0)
+                    {
+                        if (strlen(file_name) > MAX_NAME)
+                            return -ENAMETOOLONG; // File name too long
+                        dentry[j].num = child_inode->num;
+                        strcpy(dentry[j].name, file_name);
+                        
+                        // Update parent inode modification time
+                        parent_inode->mtim = time(NULL);
+
+                        return 1;
+                    }
+                }   
+            }
+        }
+    }
+
     return -ENOSPC; // No more space in parent directory
 }
 
