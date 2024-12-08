@@ -186,7 +186,7 @@ static int remove_file(const char *path)
 
     // Remove the directory entry from the parent directory
     int found = 0;
-    for (size_t i = 0; i < D_BLOCK; i++)    // Directory entries are stored in the direct blocks
+    for (int i = 0; i < D_BLOCK; i++)    // Directory entries are stored in the direct blocks
     {
         struct wfs_dentry *wfs_dentry_ptr = (struct wfs_dentry *)(disk_mmap[0] + parent_directory_inode_ptr->blocks[i]);
 
@@ -209,10 +209,9 @@ static int remove_file(const char *path)
             break;
     }
 
-    parent_directory_inode_ptr->nlinks--; // Decrement the number of links in the parent directory
 
     // Deallocate direct blocks
-    for (size_t i = 0; i < D_BLOCK; i++)
+    for (int i = 0; i < D_BLOCK; i++)
     {
         if (file->blocks[i] != 0)
         {
@@ -231,7 +230,7 @@ static int remove_file(const char *path)
     {
         printf("Deallocating indirect block...\n");
         off_t *indirect_block = (off_t *)(disk_mmap[0] + file->blocks[IND_BLOCK]);
-        for (size_t i = 0; i < BLOCK_SIZE; i++) // Indirect block can store BLOCK_SIZE/sizeof(off_t) data block pointers
+        for (off_t i = 0; i < BLOCK_SIZE; i++) // Indirect block can store BLOCK_SIZE/sizeof(off_t) data block pointers
         {
             if (indirect_block[i] != 0)
             {
@@ -276,14 +275,11 @@ static int create_new_file(const char* path, mode_t mode)
 {
     printf("create_new_file called with path: %s\n", path);       // Debugging statement
 
-    printf("Checking that directory doesn't already exist...\n");
     // Ensure that the directory doesn't already exist
     struct wfs_inode *curr_inode = get_inode_from_path(path);
     if (curr_inode != NULL)
         return -EEXIST; // Directory already exists
-    printf("Directory doesn't already exist\n");
 
-    printf("Checking that parent exists and is writable...\n");
     // Ensure parent exists and is writable
     char parent_path[strlen(path) + 1];
     strcpy(parent_path, path);
@@ -300,8 +296,6 @@ static int create_new_file(const char* path, mode_t mode)
     else
         *last_slash = '\0'; // Terminate the parent path
 
-    printf("Parent path: %s\n", parent_path);
-
     struct wfs_inode *parent_inode = get_inode_from_path(parent_path);
     if (parent_inode == NULL)
         return -ENOENT; // Parent directory doesn't exist
@@ -313,16 +307,12 @@ static int create_new_file(const char* path, mode_t mode)
     // Check if parent is writable  
     if ((parent_inode->mode & S_IWUSR) != S_IWUSR)
         return -EACCES; // Parent is not writable
-    printf("Parent exists and is writable\n");
-
-    printf("Allocating new inode for directory...\n");
 
     // Allocate a new inode for the directory (using the inode bitmap)
     struct wfs_inode *new_inode = allocate_inode(disk_mmap[0] + superblock->i_bitmap_ptr);  //Metadata shared across disks
 
     if (new_inode == NULL)
         return -ENOSPC; // No more inodes available
-    printf("Allocated new inode for directory\n");
 
     // Initialize the new inode
     new_inode->num = new_inode->num;
@@ -335,25 +325,12 @@ static int create_new_file(const char* path, mode_t mode)
     new_inode->mtim = new_inode->atim;
     new_inode->ctim = new_inode->atim;
 
-    // Print out the inode stats for debugging purposes
-    printf("Inode stats:\n");
-    printf("----------------\n");
-    printf("    Num: %d\n", new_inode->num);
-    printf("    Mode: %d\n", new_inode->mode);
-    printf("    UID: %d\n", new_inode->uid);
-    printf("    GID: %d\n", new_inode->gid);
-    printf("    Size: %ld\n", new_inode->size);
-    printf("    Nlinks: %d\n", new_inode->nlinks);
-    printf("    Atime: %ld\n", new_inode->atim);
-    printf("    Mtime: %ld\n", new_inode->mtim);
-    printf("    Ctime: %ld\n", new_inode->ctim);
-    printf("----------------\n");
-
     // Update the parent directory
     printf("Updating parent directory...\n");
     if (update_parent_directory(parent_inode, child_name, new_inode) < 0)
         return -ENOSPC; // No more space in parent directory
     printf("Parent directory updated\n");
+
     return 0;
 }
 
@@ -413,7 +390,7 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
     printf("----------------\n");
     printf("    Num: %d\n", parent_inode->num);
     printf("----------------\n");
-    
+
     // Check each block block of the parent inode to find an empty directory entry
     for (int i = 0; i < D_BLOCK; i++)
     {   
@@ -492,6 +469,28 @@ static int update_parent_directory(struct wfs_inode *parent_inode, const char* f
                 }   
             }
         }
+    }
+    // Otherwise allocate space for one
+    else
+    {
+        off_t indirect_block_ptr = allocate_data_block(0);   // Inodes shared, use the first disk and mirror later
+        if (indirect_block_ptr < 0)
+            return -ENOSPC; // No data blocks
+
+        parent_inode->blocks[IND_BLOCK] = indirect_block_ptr;
+
+        struct wfs_dentry *dentry = (struct wfs_dentry *)(disk_mmap[0] + parent_inode->blocks[IND_BLOCK]);
+
+        // Add entry to directory entries
+        if (strlen(file_name) > MAX_NAME)
+            return -ENAMETOOLONG; // File name too long
+        dentry[0].num = child_inode->num;
+        strcpy(dentry[0].name, file_name);
+
+        // Update parent inode modification time
+        parent_inode->mtim = time(NULL);
+
+        return 1;
     }
 
     return -ENOSPC; // No more space in parent directory
