@@ -151,19 +151,19 @@ static int remove_file(const char *path)
 {
     struct wfs_inode *file = get_inode_from_path(path);
     if (file == NULL)
-        return -ENOENT; // File doesn't exist
+        return -ENOENT; // Directory doesn't exist
     
     if ((file->mode & S_IWUSR) != S_IWUSR)
-        return -EACCES; // File is not writable
+        return -EACCES; // Directory is not writable
     
     if ((file->mode & S_IFDIR) == S_IFDIR && file->nlinks > 2)
         return -ENOTEMPTY; // Directory is not empty
 
-    // Remove the current file from the parent directory
-    printf("Acquiring parent directory to remove current file from...\n");
+    // Remove the current directory from the parent directory
+    printf("Acquiring parent directory to remove current directory from...\n");
     char parent_path[strlen(path) + 1]; 
     strcpy(parent_path, path);
-    char *last_slash = strrchr(parent_path, '/');     // Find the final occurrence of '/' in the path
+    char *last_slash = strrchr(parent_path, '/');     // Find the final occurence of '/' in the path
     if (last_slash == NULL)
         return -EINVAL; // Invalid path
     if (last_slash == parent_path)
@@ -173,7 +173,7 @@ static int remove_file(const char *path)
     printf("Acquired parent directory: %s\n", parent_path);
     printf("Child path: %s\n", path);
 
-    // Find the parent directory inode from the parent path, and ensure it's writable and a valid directory
+    // Find the parent directory inode from the parent path, and ensure it's writable and and a valid directory
     struct wfs_inode *parent_directory_inode_ptr = get_inode_from_path(parent_path);
     if (parent_directory_inode_ptr == NULL)
         return -ENOENT; // Parent directory doesn't exist
@@ -182,62 +182,34 @@ static int remove_file(const char *path)
     if ((parent_directory_inode_ptr->mode & S_IWUSR) != S_IWUSR)
         return -EACCES; // Parent is not writable
 
-    // Remove the file from the parent directory
+    // Remove the directory from the parent directory
     for (size_t i = 0; i < D_BLOCK; i++)
     {
         struct wfs_dentry *wfs_dentry_ptr = (struct wfs_dentry *)(disk_mmap[0] + parent_directory_inode_ptr->blocks[i]);
 
         for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++)
         {
-            // Compare the inode number in the parent directory, and if it matches the file inode number, remove it
+            // Compare the inode number in the parent directory, and if it matches the directory inode number, remove it
             if (wfs_dentry_ptr[j].num == file->num)
             {
                 wfs_dentry_ptr[j].num = 0;
                 memset(wfs_dentry_ptr[j].name, 0, MAX_NAME);
                 parent_directory_inode_ptr->mtim = time(NULL);
 
-                // Clear the bitmap bit for the file inode
+                // Clear the bitmap bit for the directory inode
                 char *inode_bitmap_ptr = disk_mmap[0] + superblock->i_bitmap_ptr;
                 off_t offset = file->num;
                 clear_inode_bitmap_bit(inode_bitmap_ptr, offset);  
-
-                // Only clear data blocks for regular files
-                if ((file->mode & S_IFDIR) != S_IFDIR)
-                {
-                    // Clear the data blocks in direct blocks
-                    for (size_t k = 0; k < D_BLOCK; k++)
-                    {
-                        if (file->blocks[k] != 0)
-                        {
-                            clear_inode_bitmap_bit(disk_mmap[0] + superblock->d_bitmap_ptr, file->blocks[k] / BLOCK_SIZE);
-                        }
-                    }
-
-                    // Clear the data blocks in indirect block
-                    if (file->blocks[IND_BLOCK] != 0)
-                    {
-                        off_t *indirect_block = (off_t *)(disk_mmap[0] + file->blocks[IND_BLOCK]);
-                        for (size_t k = 0; k < BLOCK_SIZE / sizeof(off_t); k++)
-                        {
-                            if (indirect_block[k] != 0)
-                            {
-                                clear_inode_bitmap_bit(disk_mmap[0] + superblock->d_bitmap_ptr, indirect_block[k] / BLOCK_SIZE);
-                            }
-                        }
-                        // Clear the indirect block itself
-                        clear_inode_bitmap_bit(disk_mmap[0] + superblock->d_bitmap_ptr, file->blocks[IND_BLOCK] / BLOCK_SIZE);
-                    }
-                }
 
                 mirror_raid();
                 return 0;
             }
         }
     }
-
     // Entry otherwise was not found
     return -ENOENT;
 }
+
 
 // Used by wfs_mkdir and wfs_mknod, due to their redundancies
 static int create_new_file(const char* path, mode_t mode)
